@@ -289,6 +289,11 @@ export const SHOTS: Record<string, string[]> = {
   'aichat': ['https://github.com/user-attachments/assets/6c58c549-1564-43cf-b772-e1c9fe91d19c', 'https://github.com/user-attachments/assets/218fab08-cdae-4c3b-bcf8-39b6651f1362', 'https://github.com/user-attachments/assets/0c77e901-0da2-4151-aefc-a2af96bbb004'],
   'dive': ['https://raw.githubusercontent.com/OpenAgentPlatform/Dive/main/docs/0.8.0_DiveGIF.gif'],
   'pinokio': ['https://raw.githubusercontent.com/pinokiocomputer/pinokio/main/install.png'],
+  // 以下四个工具的代码托管在 GitLab / 自建 Git，README 抓不到图，改用官方页面或自由授权截图
+  'inkscape': ['https://upload.wikimedia.org/wikipedia/commons/9/9b/Screenshot_of_Inkscape_02.png', 'https://upload.wikimedia.org/wikipedia/commons/b/b3/Screenshot_of_Inkscape_03.png'],
+  'mkvtoolnix': ['https://upload.wikimedia.org/wikipedia/commons/6/6c/MKVToolNix_GUI_70.0.0.png'],
+  'putty': ['https://upload.wikimedia.org/wikipedia/commons/1/16/PuTTY_Key_Generator.png'],
+  'es-de': ['https://cdn.es-de.org/docs/images/es-de_system_view.png', 'https://cdn.es-de.org/docs/images/es-de_gamelist_view.png'],
 };
 
 export function shotsOf(toolId: string): string[] {

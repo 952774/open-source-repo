@@ -2,6 +2,19 @@
 
 本项目遵循语义化版本。清单（tools.ts）的增删不计入版本号，随发布一起更新。
 
+## v1.0.1 — 2026-11-25
+
+补齐 v1.0.0 遗留的预览图缺口。
+
+- **288 款工具全部有预览图**。v1.0.0 里 4 个工具的代码不在 GitHub（Inkscape、MKVToolNix、PuTTY 在
+  GitLab 或自建 Git，EmulationStation DE 在 GitLab），README 抓图脚本够不到，详情页会落到「暂未内置截图」
+  占位。改用官方页面与自由授权截图补齐：Inkscape / MKVToolNix 取 Wikimedia Commons，
+  EmulationStation DE 取官方文档 CDN，PuTTY 取已验证可访问的一张。
+- `tauri.conf.json` 的 CSP `img-src` 放行 `upload.wikimedia.org` 与 `cdn.es-de.org`，否则新图会被拦。
+- 新增 `scripts/selfcheck.py`：一条命令核对 i18n key 完整性、排序口径、下载量与截图覆盖率、
+  三处版本号一致性、CSP 与插件配置。CI 与本地都能跑。
+- 修正 `selfcheck.py` 的工具计数：套装（BUNDLES）没有 `wingetId`，不该算进工具总数。
+
 ## v1.0.0 — 2026-11-24
 
 首个正式版。相较 v0.9.0 的改动全部围绕「用户能不能信这个工具」展开。
