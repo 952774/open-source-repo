@@ -1,0 +1,10 @@
+node_modules/
+dist/
+target/
+.tauri-keys/
+*.key
+reports/
+.github-token
+.tmp/
+.github/workflows/
+.git-askpass.cmd

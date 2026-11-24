@@ -1,0 +1,1528 @@
+//! ToolArk 桌面端核心
+//!
+//! 三块职责：
+//! 1. winget 安装引擎（流式进度、失败回滚、自定义位置回退）
+//! 2. 已安装状态校准（以 `winget list` 为真相，不再只信本地记录）
+//! 3. 应用启动与桌面快捷方式（注册表定位 exe → 启动 / 建 .lnk）
+//!
+//! 安全原则：ID 白名单校验 / 参数化调用（不拼 shell 字符串）/ 最小权限
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+
+use encoding_rs::GBK;
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+
+// ─────────────────────────────────────────────────────────────
+// 基础工具
+// ─────────────────────────────────────────────────────────────
+
+/// winget ID 与 tool ID 只允许安全字符，杜绝命令注入
+fn validate_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.len() > 120 {
+        return Err("无效的 ID：长度异常".into());
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err("无效的 ID：包含非法字符".into());
+    }
+    Ok(())
+}
+
+fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("无法获取数据目录: {}", e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建数据目录: {}", e))?;
+    Ok(dir)
+}
+
+fn records_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(data_dir(app)?.join("installed.json"))
+}
+
+fn read_records(app: &AppHandle) -> Vec<String> {
+    let Ok(path) = records_path(app) else {
+        return vec![];
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return vec![];
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_records(app: &AppHandle, ids: &[String]) -> Result<(), String> {
+    let path = records_path(app)?;
+    let text = serde_json::to_string_pretty(ids).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("写入安装记录失败: {}", e))
+}
+
+// ─────────────────────────────────────────────────────────────
+// 日志落盘（保留 7 天）
+// ─────────────────────────────────────────────────────────────
+
+fn logs_dir(app: &AppHandle) -> Option<PathBuf> {
+    let dir = data_dir(app).ok()?.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn today_stamp() -> String {
+    // 用本地时间做文件名：UTC 秒数 + 东八区偏移近似即可，仅用于分文件
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    format!("day-{}", days)
+}
+
+/// 追加一行日志到 logs/day-<n>.log，并顺手清理 7 天前的文件
+fn log_line(app: &AppHandle, scope: &str, text: &str) {
+    let Some(dir) = logs_dir(app) else { return };
+    let path = dir.join(format!("{}.log", today_stamp()));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{}] [{}] {}\n", stamp, scope, text);
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+    prune_logs(&dir, 7);
+}
+
+fn prune_logs(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("log") {
+                return None;
+            }
+            let name = p.file_stem()?.to_str()?.to_string();
+            let day: u64 = name.strip_prefix("day-")?.parse().ok()?;
+            Some((day, p))
+        })
+        .collect();
+    if files.len() <= keep {
+        return;
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, p) in files.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+fn summarize(stdout: &[u8], stderr: &[u8]) -> String {
+    let err = String::from_utf8_lossy(stderr);
+    let out = String::from_utf8_lossy(stdout);
+    let s = if err.trim().is_empty() {
+        out.trim()
+    } else {
+        err.trim()
+    };
+    if s.is_empty() {
+        "未知错误".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// 从 winget 输出中提取百分比（取本段内最高值）
+fn parse_percent(text: &str) -> Option<u8> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut best: Option<u8> = None;
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '%' {
+            continue;
+        }
+        let mut j = i;
+        while j > 0 && (chars[j - 1].is_ascii_digit() || chars[j - 1] == '.') {
+            j -= 1;
+        }
+        let num: String = chars[j..i].iter().collect();
+        if let Ok(v) = num.parse::<f64>() {
+            let p = v.round().clamp(0.0, 100.0) as u8;
+            if best.map_or(true, |b| p > b) {
+                best = Some(p);
+            }
+        }
+    }
+    best
+}
+
+/// 进度事件负载
+#[derive(Clone, serde::Serialize)]
+struct ProgressPayload {
+    tool_id: String,
+    percent: u8,
+    message: String,
+    phase: String,
+}
+
+/// 解码 winget 输出：优先 UTF-8，非法字节回退 GBK（中文 Windows 控制台常见）。
+/// 用字节读取而非 lines()，因为 lines() 遇到非 UTF-8 会返回 Err，
+/// 一旦中断读取，子进程 stdout 管道塞满后会直接卡死。
+fn decode_output(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(v) => v.to_string(),
+        Err(_) => {
+            let (cow, _, _) = GBK.decode(bytes);
+            cow.into_owned()
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// winget 定位与执行
+// ─────────────────────────────────────────────────────────────
+
+/// 列出所有可能的 winget 启动方式，按优先级排列。
+/// winget.exe 在 WindowsApps 下是一个指向受保护目录的 reparse point，
+/// 直接用裸命令名在部分环境下会 NotFound，因此准备多级回退：
+/// 别名 → 真实包目录 → PATH 扫描 → 裸命令 → 系统命令解释器。
+fn winget_candidates() -> Vec<(String, Vec<String>)> {
+    let mut list: Vec<(String, Vec<String>)> = Vec::new();
+
+    // 1) 用户级应用执行别名（最常见、权限正常）
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let alias = format!("{local}\\Microsoft\\WindowsApps\\winget.exe");
+        if Path::new(&alias).exists() {
+            list.push((alias, Vec::new()));
+        }
+    }
+
+    // 2) WindowsApps 下的真实安装目录（DesktopAppInstaller 包）
+    let base = Path::new("C:\\Program Files\\WindowsApps");
+    if let Ok(entries) = std::fs::read_dir(base) {
+        let mut found: Vec<(u64, String)> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("Microsoft.DesktopAppInstaller_") && name.contains("_x64__") {
+                let exe = entry.path().join("winget.exe");
+                if exe.exists() {
+                    let ver: u64 = name
+                        .split('_')
+                        .nth(1)
+                        .and_then(|v| v.split('.').next())
+                        .and_then(|maj| maj.parse().ok())
+                        .unwrap_or(0);
+                    found.push((ver, exe.to_string_lossy().to_string()));
+                }
+            }
+        }
+        found.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, path) in found {
+            list.push((path, Vec::new()));
+        }
+    }
+
+    // 3) 扫描 PATH（有些机器别名被删掉，但 WindowsApps 仍在 PATH 里）
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(';') {
+            let dir = dir.trim().trim_matches('"');
+            if dir.is_empty() {
+                continue;
+            }
+            let exe = Path::new(dir).join("winget.exe");
+            if exe.exists() {
+                let s = exe.to_string_lossy().to_string();
+                if !list.iter().any(|(p, _)| p.eq_ignore_ascii_case(&s)) {
+                    list.push((s, Vec::new()));
+                }
+            }
+        }
+    }
+
+    // 4) 裸命令名，交给 CreateProcess 自己解析
+    list.push(("winget.exe".to_string(), Vec::new()));
+
+    // 5) 兜底：交给系统命令解释器解析（它能正确处理 App Execution Alias）
+    list.push((
+        "cmd.exe".to_string(),
+        vec!["/c".to_string(), "winget".to_string()],
+    ));
+
+    list
+}
+
+/// 流式执行 winget：原生进程 + 逐行读输出 + emit 进度事件。
+/// 返回 (是否成功, 合并后的完整输出)
+async fn run_winget_stream(
+    app: &AppHandle,
+    args: Vec<String>,
+    tool_id: &str,
+    event_name: &str,
+) -> Result<(bool, String), String> {
+    let mut spawned: Option<tokio::process::Child> = None;
+    let mut tried: Vec<String> = Vec::new();
+    let mut candidates = winget_candidates();
+    let cmd_fallback = if candidates.last().map_or(false, |(e, _)| e == "cmd.exe") {
+        candidates.pop()
+    } else {
+        None
+    };
+
+    for (exe, prefix) in candidates {
+        let mut cmd = Command::new(&exe);
+        cmd.args(&prefix);
+        cmd.args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        match cmd.spawn() {
+            Ok(child) => {
+                spawned = Some(child);
+                break;
+            }
+            Err(e) => tried.push(format!("{exe}（{e}）")),
+        }
+    }
+
+    if spawned.is_none() {
+        if let Some((exe, prefix)) = cmd_fallback {
+            let mut cmd = Command::new(&exe);
+            cmd.args(&prefix);
+            cmd.args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::null());
+            #[cfg(windows)]
+            {
+                cmd.creation_flags(0x0800_0000);
+            }
+            match cmd.spawn() {
+                Ok(child) => spawned = Some(child),
+                Err(e) => tried.push(format!("{exe}（{e}）")),
+            }
+        }
+    }
+
+    let mut child = match spawned {
+        Some(c) => c,
+        None => {
+            return Err(format!(
+                "无法启动 winget，已尝试 {} 种方式均失败：{}。请确认「应用安装程序 / App Installer」已安装。",
+                tried.len(),
+                tried.join("；")
+            ))
+        }
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    if let Some(out) = child.stdout.take() {
+        let tx = tx.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut reader = BufReader::new(out);
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let text = decode_output(&buf);
+                        if tx.send(text).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        let tx2 = tx.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut reader = BufReader::new(err);
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let text = decode_output(&buf);
+                        if tx2.send(text).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    drop(tx);
+
+    let mut collected = String::new();
+    while let Some(text) = rx.recv().await {
+        if let Some(pct) = parse_percent(&text) {
+            let lower = text.to_lowercase();
+            let phase =
+                if lower.contains("download") || text.contains("下载") || lower.contains(" mb") {
+                    "download"
+                } else {
+                    "install"
+                };
+            let _ = app.emit(
+                event_name,
+                ProgressPayload {
+                    tool_id: tool_id.to_string(),
+                    percent: pct,
+                    message: text.trim().chars().take(180).collect(),
+                    phase: phase.to_string(),
+                },
+            );
+        }
+        collected.push_str(&text);
+        collected.push('\n');
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("等待 winget 结束失败：{}", e))?;
+
+    Ok((status.success(), collected))
+}
+
+fn install_args(winget_id: &str, location: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "install".into(),
+        "--id".into(),
+        winget_id.to_string(),
+        "--exact".into(),
+        "--source".into(),
+        "winget".into(),
+        "--accept-package-agreements".into(),
+        "--accept-source-agreements".into(),
+        "--disable-interactivity".into(),
+    ];
+    if let Some(l) = location {
+        args.push("--location".into());
+        args.push(l.to_string());
+    }
+    args
+}
+
+// ─────────────────────────────────────────────────────────────
+// PowerShell 助手（应用定位 / 快捷方式）
+// ─────────────────────────────────────────────────────────────
+
+const APP_LOOKUP_PS1: &str = include_str!("app_lookup.ps1");
+const MAKE_SHORTCUT_PS1: &str = include_str!("make_shortcut.ps1");
+
+/// 把内嵌脚本写到数据目录，返回路径（每次覆盖，保证与程序同版本）
+fn materialize_script(app: &AppHandle, name: &str, body: &str) -> Result<PathBuf, String> {
+    let dir = data_dir(app)?.join("scripts");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建脚本目录: {e}"))?;
+    let path = dir.join(name);
+    std::fs::write(&path, body).map_err(|e| format!("写入脚本失败: {e}"))?;
+    Ok(path)
+}
+
+fn powershell_exe() -> String {
+    // 64 位系统上 System32 里的 Windows PowerShell 一定存在
+    let sys = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    format!("{sys}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+}
+
+async fn run_ps1(
+    app: &AppHandle,
+    script: &str,
+    body: &str,
+    envs: &[(&str, String)],
+) -> Result<String, String> {
+    let path = materialize_script(app, script, body)?;
+    let mut cmd = Command::new(powershell_exe());
+    cmd.arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(&path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| format!("启动 PowerShell 失败: {e}"))?;
+    let stdout = decode_output(&out.stdout);
+    let stderr = decode_output(&out.stderr);
+    if !out.status.success() && stdout.trim().is_empty() {
+        log_line(app, "ps1", &format!("{script} 失败: {}", stderr.trim()));
+        return Err(format!("脚本执行失败: {}", stderr.trim()));
+    }
+    Ok(stdout)
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct AppTarget {
+    exe: Option<String>,
+    workdir: Option<String>,
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+    source: Option<String>,
+}
+
+/// 缓存表：显示名 → 解析结果，避免每次点「打开」都跑一遍注册表扫描
+fn app_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(data_dir(app)?.join("app-paths.json"))
+}
+
+fn read_app_cache(app: &AppHandle) -> std::collections::HashMap<String, AppTarget> {
+    let Ok(path) = app_cache_path(app) else {
+        return Default::default();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Default::default();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_app_cache(
+    app: &AppHandle,
+    map: &std::collections::HashMap<String, AppTarget>,
+) -> Result<(), String> {
+    let path = app_cache_path(app)?;
+    let text = serde_json::to_string_pretty(map).map_err(|e| e.to_string())?;
+    std::fs::write(path, text).map_err(|e| format!("写入应用路径缓存失败: {e}"))
+}
+
+async fn lookup_app(app: &AppHandle, name: &str) -> Option<AppTarget> {
+    let mut cache = read_app_cache(app);
+    if let Some(hit) = cache.get(name) {
+        if let Some(exe) = &hit.exe {
+            if Path::new(exe).exists() {
+                return Some(hit.clone());
+            }
+        }
+    }
+    let out = run_ps1(
+        app,
+        "app_lookup.ps1",
+        APP_LOOKUP_PS1,
+        &[("TOOLARK_NAME", name.to_string())],
+    )
+    .await
+    .ok()?;
+    let line = out.lines().find(|l| l.trim_start().starts_with('{'))?;
+    let parsed: AppTarget = serde_json::from_str(line.trim()).ok()?;
+    if parsed.exe.is_none() {
+        log_line(app, "lookup", &format!("未定位到应用: {name}"));
+        return None;
+    }
+    cache.insert(name.to_string(), parsed.clone());
+    let _ = write_app_cache(app, &cache);
+    Some(parsed)
+}
+
+async fn create_shortcut(app: &AppHandle, name: &str, target: &AppTarget) -> Option<String> {
+    let exe = target.exe.clone()?;
+    let workdir = target.workdir.clone().unwrap_or_default();
+    let out = run_ps1(
+        app,
+        "make_shortcut.ps1",
+        MAKE_SHORTCUT_PS1,
+        &[
+            ("TOOLARK_TARGET", exe),
+            ("TOOLARK_LNKNAME", name.to_string()),
+            ("TOOLARK_WORKDIR", workdir),
+        ],
+    )
+    .await
+    .ok()?;
+    let line = out.lines().find(|l| l.trim_start().starts_with('{'))?;
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+        v.get("path")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+    } else {
+        log_line(
+            app,
+            "shortcut",
+            &format!(
+                "创建快捷方式失败: {}",
+                v.get("error").and_then(|x| x.as_str()).unwrap_or("?")
+            ),
+        );
+        None
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命令：安装 / 卸载
+// ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn install_tool(
+    app: AppHandle,
+    tool_id: String,
+    winget_id: String,
+    name: String,
+    install_location: Option<String>,
+) -> Result<String, String> {
+    validate_id(&tool_id)?;
+    validate_id(&winget_id)?;
+
+    let location = install_location
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    if let Some(ref loc) = location {
+        if !loc
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
+            || !loc.contains(':')
+            || loc.contains('\n')
+            || loc.contains('\r')
+            || loc.contains('"')
+        {
+            return Err(format!("安装路径无效：{loc}"));
+        }
+        if !Path::new(loc).exists() {
+            std::fs::create_dir_all(loc).map_err(|e| format!("无法创建安装目录 {loc}: {e}"))?;
+        }
+    }
+
+    log_line(
+        &app,
+        "install",
+        &format!("开始 {name} ({winget_id}) location={location:?}"),
+    );
+
+    let mut used_location = location.is_some();
+    let (mut ok, mut log) = run_winget_stream(
+        &app,
+        install_args(&winget_id, location.as_deref()),
+        &tool_id,
+        "install-progress",
+    )
+    .await?;
+
+    // 部分安装器（MSI 等）不支持自定义位置：识别后自动回退默认路径重试
+    if !ok && used_location {
+        let unsupported = [
+            "does not support a custom install location",
+            "不支持",
+            "--location",
+            "0x8A15002B",
+            "installer type",
+        ]
+        .iter()
+        .any(|k| log.contains(k));
+        if unsupported {
+            used_location = false;
+            let _ = app.emit(
+                "install-progress",
+                ProgressPayload {
+                    tool_id: tool_id.clone(),
+                    percent: 0,
+                    message: "该安装器不支持自定义位置，正在改用默认路径…".into(),
+                    phase: "install".into(),
+                },
+            );
+            let (ok2, log2) = run_winget_stream(
+                &app,
+                install_args(&winget_id, None),
+                &tool_id,
+                "install-progress",
+            )
+            .await?;
+            ok = ok2;
+            log = log2;
+        }
+    }
+
+    if !ok {
+        log_line(
+            &app,
+            "install",
+            &format!("失败 {name}: {}", log.chars().take(500).collect::<String>()),
+        );
+        let (rolled, _) = run_winget_stream(
+            &app,
+            vec![
+                "uninstall".into(),
+                "--id".into(),
+                winget_id.clone(),
+                "--exact".into(),
+                "--source".into(),
+                "winget".into(),
+                "--disable-interactivity".into(),
+            ],
+            &tool_id,
+            "install-progress",
+        )
+        .await?;
+        let suffix = if rolled {
+            "；已自动回滚清理残留"
+        } else {
+            "；回滚未执行（包可能未安装）"
+        };
+        return Err(format!(
+            "安装 {} 失败: {}{}",
+            name,
+            summarize(log.as_bytes(), b""),
+            suffix
+        ));
+    }
+
+    let _ = app.emit(
+        "install-progress",
+        ProgressPayload {
+            tool_id: tool_id.clone(),
+            percent: 100,
+            message: "安装完成".into(),
+            phase: "done".into(),
+        },
+    );
+
+    let mut ids = read_records(&app);
+    if !ids.contains(&tool_id) {
+        ids.push(tool_id.clone());
+        write_records(&app, &ids)?;
+    }
+
+    // 安装成功后：定位真实 exe 并建桌面快捷方式
+    let mut notes: Vec<String> = Vec::new();
+    match lookup_app(&app, &name).await {
+        Some(target) => {
+            if let Some(lnk) = create_shortcut(&app, &name, &target).await {
+                let file = Path::new(&lnk)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or(lnk);
+                notes.push(format!("已创建桌面快捷方式 {file}"));
+            } else {
+                notes.push("未能创建桌面快捷方式（可手动右键程序创建）".into());
+            }
+        }
+        None => notes.push("未能定位程序路径，快捷方式已跳过".into()),
+    }
+    if location.is_some() && used_location {
+        notes.push("已装到自定义位置".into());
+    } else if location.is_some() {
+        notes.push("该工具不支持自定义位置，已装到默认路径".into());
+    }
+
+    Ok(format!("{} 安装成功（{}）", name, notes.join("；")))
+}
+
+#[tauri::command]
+async fn uninstall_tool(
+    app: AppHandle,
+    tool_id: String,
+    winget_id: String,
+    name: String,
+    clean_config: Option<bool>,
+) -> Result<String, String> {
+    validate_id(&tool_id)?;
+    validate_id(&winget_id)?;
+
+    let (ok, log) = run_winget_stream(
+        &app,
+        vec![
+            "uninstall".into(),
+            "--id".into(),
+            winget_id.clone(),
+            "--exact".into(),
+            "--source".into(),
+            "winget".into(),
+            "--disable-interactivity".into(),
+        ],
+        &tool_id,
+        "uninstall-progress",
+    )
+    .await?;
+
+    if !ok {
+        log_line(
+            &app,
+            "uninstall",
+            &format!("失败 {name}: {}", log.chars().take(500).collect::<String>()),
+        );
+        return Err(format!(
+            "卸载 {} 失败: {}",
+            name,
+            summarize(log.as_bytes(), b"")
+        ));
+    }
+
+    let _ = app.emit(
+        "uninstall-progress",
+        ProgressPayload {
+            tool_id: tool_id.clone(),
+            percent: 100,
+            message: "卸载完成".into(),
+            phase: "done".into(),
+        },
+    );
+
+    let mut ids = read_records(&app);
+    ids.retain(|x| x != &tool_id);
+    write_records(&app, &ids)?;
+
+    if clean_config.unwrap_or(false) {
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        if !appdata.is_empty() {
+            let safe_name = tool_id.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_");
+            let config_dir = Path::new(&appdata).join(&safe_name);
+            if config_dir.exists() && config_dir.is_dir() {
+                let _ = std::fs::remove_dir_all(&config_dir);
+            }
+        }
+    }
+    log_line(&app, "uninstall", &format!("完成 {name}"));
+    Ok(format!(
+        "{} 已卸载{}",
+        name,
+        if clean_config.unwrap_or(false) {
+            "（含配置）"
+        } else {
+            ""
+        }
+    ))
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命令：已安装校准（以 winget list 为真相）
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, serde::Serialize)]
+pub struct InstalledPackage {
+    /// winget 包 ID（如 Microsoft.VisualStudioCode）
+    id: String,
+    /// 显示名
+    name: String,
+    /// 已安装版本
+    version: String,
+}
+
+/// 解析 `winget list` / `winget upgrade` 的表格行。
+///
+/// 列宽会因中文双宽字符而错位，所以不按固定列偏移切，而按"从右往左"定位：
+/// 最后一列一定是源（winget / msstore）；倒数第二、三列是版本号（纯数字点分，
+/// 可能为空）；包 ID 是"含点且含 ASCII 字母"的那个 token。
+fn parse_package_table(stdout: &str) -> Vec<InstalledPackage> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.starts_with('\\') {
+            continue;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if tokens.len() < 3 {
+            continue;
+        }
+        let first = tokens[0];
+        if first == "Name" || first == "名称" || first.eq_ignore_ascii_case("name") {
+            continue;
+        }
+        let last = tokens[tokens.len() - 1];
+        if last != "winget" && last != "msstore" {
+            continue;
+        }
+
+        // 从右往左找包 ID：含 '.'、含至少一个 ASCII 字母、不含非 ASCII
+        let mut id_idx: Option<usize> = None;
+        for i in (0..tokens.len() - 1).rev() {
+            let t = tokens[i];
+            if t.contains('.')
+                && t.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '+'
+                })
+                && t.chars().any(|c| c.is_ascii_alphabetic())
+            {
+                id_idx = Some(i);
+                break;
+            }
+        }
+        let Some(idx) = id_idx else { continue };
+        let id = tokens[idx].to_string();
+        let name = if idx == 0 {
+            id.clone()
+        } else {
+            tokens[..idx].join(" ")
+        };
+        let version = tokens
+            .get(idx + 1)
+            .filter(|t| {
+                t.chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
+            })
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        out.push(InstalledPackage { id, name, version });
+    }
+    out
+}
+
+/// 读取系统真实已安装的 winget 包列表。
+/// 这一步是"已安装"状态的唯一真相来源：本地 installed.json 只做补充，
+/// 用户用 winget 自己装的、或在外部卸载的，都能被纠正。
+#[tauri::command]
+async fn scan_installed(app: AppHandle) -> Result<Vec<InstalledPackage>, String> {
+    let (_ok, log) = run_winget_stream(
+        &app,
+        vec![
+            "list".into(),
+            "--source".into(),
+            "winget".into(),
+            "--accept-source-agreements".into(),
+            "--disable-interactivity".into(),
+        ],
+        "diag",
+        "scan-progress",
+    )
+    .await?;
+    let items = parse_package_table(&log);
+    log_line(
+        &app,
+        "scan",
+        &format!("winget list 解析出 {} 个包", items.len()),
+    );
+    Ok(items)
+}
+
+#[tauri::command]
+fn list_installed(app: AppHandle) -> Result<Vec<String>, String> {
+    Ok(read_records(&app))
+}
+
+#[tauri::command]
+fn persist_installed(app: AppHandle, ids: Vec<String>) -> Result<(), String> {
+    let mut clean: Vec<String> = Vec::new();
+    for id in ids {
+        if validate_id(&id).is_ok() && !clean.contains(&id) {
+            clean.push(id);
+        }
+    }
+    write_records(&app, &clean)
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命令：打开应用 / 快捷方式
+// ─────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct OpenResult {
+    ok: bool,
+    message: String,
+    exe: Option<String>,
+}
+
+/// 打开已安装的应用
+#[tauri::command]
+async fn open_tool(
+    app: AppHandle,
+    name: String,
+    _tool_id: Option<String>,
+) -> Result<OpenResult, String> {
+    let Some(target) = lookup_app(&app, &name).await else {
+        return Ok(OpenResult {
+            ok: false,
+            message: format!("未能定位 {name} 的启动程序，可能安装到了非标准位置"),
+            exe: None,
+        });
+    };
+    let Some(exe) = target.exe.clone() else {
+        return Ok(OpenResult {
+            ok: false,
+            message: "未找到可执行文件".into(),
+            exe: None,
+        });
+    };
+    let mut cmd = std::process::Command::new(&exe);
+    if let Some(dir) = &target.workdir {
+        if Path::new(dir).exists() {
+            cmd.current_dir(dir);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // DETACHED_PROCESS：不继承控制台，避免带出黑窗
+        cmd.creation_flags(0x0000_0008);
+    }
+    match cmd.spawn() {
+        Ok(_) => {
+            log_line(&app, "open", &format!("启动 {name} → {exe}"));
+            Ok(OpenResult {
+                ok: true,
+                message: format!("已启动 {name}"),
+                exe: Some(exe),
+            })
+        }
+        Err(e) => Ok(OpenResult {
+            ok: false,
+            message: format!("启动失败: {e}"),
+            exe: Some(exe),
+        }),
+    }
+}
+
+/// 查询程序位置（不启动），供详情页显示路径 / 判断是否可打开
+#[tauri::command]
+async fn resolve_app(app: AppHandle, name: String) -> Result<Option<AppTarget>, String> {
+    Ok(lookup_app(&app, &name).await)
+}
+
+/// 手动（重新）创建桌面快捷方式
+#[tauri::command]
+async fn make_desktop_shortcut(app: AppHandle, name: String) -> Result<String, String> {
+    let Some(target) = lookup_app(&app, &name).await else {
+        return Err(format!("未能定位 {name} 的程序路径"));
+    };
+    match create_shortcut(&app, &name, &target).await {
+        Some(path) => Ok(path),
+        None => Err("创建桌面快捷方式失败".into()),
+    }
+}
+
+/// 打开网址（官网 / 仓库 / 镜像下载）
+#[tauri::command]
+fn open_url(app: AppHandle, url: String) -> Result<(), String> {
+    let lower = url.to_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) {
+        return Err("只允许打开 http/https 链接".into());
+    }
+    log_line(&app, "open", &format!("打开链接 {url}"));
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd.exe")
+            .args(["/c", "start", "", &url])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map_err(|e| format!("打开链接失败: {e}"))?;
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| format!("打开链接失败: {e}"))?;
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命令：网络诊断与 WinHTTP 代理
+// ─────────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct ProxyState {
+    /// WinINET（浏览器/大部分程序）代理，如 127.0.0.1:6129
+    user_proxy: Option<String>,
+    user_proxy_enabled: bool,
+    /// WinHTTP（winget 走这条）代理，空字符串表示直连
+    winhttp_proxy: String,
+}
+
+#[tauri::command]
+async fn get_proxy_state(app: AppHandle) -> Result<ProxyState, String> {
+    // WinINET：HKCU\...\Internet Settings
+    let out = run_ps1(&app, "proxy_state.ps1", PROXY_STATE_PS1, &[])
+        .await
+        .unwrap_or_else(|_| "{}".to_string());
+    let line = out
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or("{}");
+    let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or(serde_json::json!({}));
+    Ok(ProxyState {
+        user_proxy: v
+            .get("userProxy")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+        user_proxy_enabled: v
+            .get("userProxyEnabled")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        winhttp_proxy: v
+            .get("winhttpProxy")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+const PROXY_STATE_PS1: &str = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+$key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
+$p = Get-ItemProperty -Path $key
+$userProxy = $null
+if ($p.ProxyServer) { $userProxy = [string]$p.ProxyServer }
+$enabled = $false
+if ($p.ProxyEnable -eq 1) { $enabled = $true }
+$winhttp = ''
+try {
+  $txt = & netsh winhttp show proxy 2>$null | Out-String
+  if ($txt -match '(?im)^\s*(?:Proxy Server\(s\)|代理服务器)\s*:\s*(.+)$') {
+    $v = $matches[1].Trim()
+    if ($v -notmatch '(?i)direct|直接') { $winhttp = $v }
+  }
+} catch {}
+$o = [ordered]@{ userProxy = $userProxy; userProxyEnabled = $enabled; winhttpProxy = $winhttp }
+Write-Output ($o | ConvertTo-Json -Compress)
+"#;
+
+/// 把系统 WinINET 代理同步到 WinHTTP（winget 只认 WinHTTP）
+/// 需要管理员权限，用 UAC 提权执行 netsh。
+#[tauri::command]
+async fn sync_winhttp_proxy(app: AppHandle, proxy: String) -> Result<String, String> {
+    let proxy = proxy.trim().to_string();
+    if proxy.is_empty() {
+        return Err("代理地址为空".into());
+    }
+    // 只允许 host:port 形式，防止命令注入
+    let ok_chars = proxy.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '.' || c == ':' || c == '-' || c == '[' || c == ']'
+    });
+    if !ok_chars || !proxy.contains(':') {
+        return Err(format!("代理地址格式无效：{proxy}"));
+    }
+    let cmdline = format!("netsh winhttp set proxy {proxy}");
+    let ps = format!(
+        "Start-Process -FilePath 'netsh.exe' -ArgumentList 'winhttp','set','proxy','{}' -Verb RunAs -Wait -WindowStyle Hidden",
+        proxy
+    );
+    let out = run_ps1(
+        &app,
+        "elevate_proxy.ps1",
+        &format!(
+            "$ErrorActionPreference='Stop'\n{}\nWrite-Output '{{\"ok\":true}}'",
+            ps
+        ),
+        &[],
+    )
+    .await?;
+    log_line(&app, "proxy", &format!("执行 {cmdline} → {}", out.trim()));
+    Ok(format!("已将 WinHTTP 代理设为 {proxy}"))
+}
+
+/// 撤销 WinHTTP 代理（恢复直连）
+#[tauri::command]
+async fn reset_winhttp_proxy(app: AppHandle) -> Result<String, String> {
+    let ps = "Start-Process -FilePath 'netsh.exe' -ArgumentList 'winhttp','reset','proxy' -Verb RunAs -Wait -WindowStyle Hidden";
+    let out = run_ps1(
+        &app,
+        "elevate_proxy_reset.ps1",
+        &format!(
+            "$ErrorActionPreference='Stop'\n{}\nWrite-Output '{{\"ok\":true}}'",
+            ps
+        ),
+        &[],
+    )
+    .await?;
+    log_line(
+        &app,
+        "proxy",
+        &format!("重置 WinHTTP 代理 → {}", out.trim()),
+    );
+    Ok("已恢复 WinHTTP 直连".into())
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命令：配置备份 / 升级 / 诊断
+// ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn backup_configs() -> Result<serde_json::Value, String> {
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    let mut entries = Vec::new();
+    if !appdata.is_empty() {
+        let base = Path::new(&appdata);
+        let candidates = [
+            ("vscode", "Code/User/settings.json"),
+            ("starship", "starship.toml"),
+            ("lazygit", "lazygit/config.yml"),
+        ];
+        for (tool, rel) in candidates {
+            let path = base.join(rel);
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                entries.push(serde_json::json!({
+                    "toolId": tool,
+                    "fileName": Path::new(rel).file_name().unwrap_or_default().to_string_lossy(),
+                    "content": content,
+                }));
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "exportedAt": chrono_now(),
+        "entries": entries,
+    }))
+}
+
+#[tauri::command]
+fn restore_configs(snapshot: serde_json::Value) -> Result<String, String> {
+    let appdata = std::env::var("APPDATA").unwrap_or_default();
+    if appdata.is_empty() {
+        return Err("无法定位 APPDATA".into());
+    }
+    let entries = snapshot
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .ok_or("备份格式无效")?;
+    let map = [
+        ("vscode", "Code/User/settings.json"),
+        ("starship", "starship.toml"),
+        ("lazygit", "lazygit/config.yml"),
+    ];
+    let mut count = 0;
+    for entry in entries {
+        let tool = entry.get("toolId").and_then(|v| v.as_str()).unwrap_or("");
+        let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some((_, rel)) = map.iter().find(|(t, _)| *t == tool) {
+            let path = Path::new(&appdata).join(rel);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&path, content).map_err(|e| format!("写入 {} 失败: {}", tool, e))?;
+            count += 1;
+        }
+    }
+    Ok(format!("已还原 {} 个配置文件", count))
+}
+
+fn chrono_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{}", secs)
+}
+
+#[derive(serde::Serialize)]
+struct Upgradable {
+    winget_id: String,
+    name: String,
+    current: String,
+    available: String,
+}
+
+#[tauri::command]
+async fn list_upgradable(app: AppHandle) -> Result<Vec<Upgradable>, String> {
+    let (_ok, log) = run_winget_stream(
+        &app,
+        vec![
+            "upgrade".into(),
+            "--include-unknown".into(),
+            "--source".into(),
+            "winget".into(),
+            "--accept-source-agreements".into(),
+            "--disable-interactivity".into(),
+        ],
+        "diag",
+        "upgrade-scan",
+    )
+    .await?;
+
+    let items: Vec<Upgradable> = parse_package_table(&log)
+        .into_iter()
+        .map(|p| Upgradable {
+            winget_id: p.id,
+            name: p.name,
+            current: p.version,
+            available: String::new(),
+        })
+        .collect();
+    // 从原始表格补出 available 列（第 idx+2 个 token）
+    let mut fixed = Vec::new();
+    for line in log.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') {
+            continue;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if tokens.len() < 4 {
+            continue;
+        }
+        let last = tokens[tokens.len() - 1];
+        if last != "winget" && last != "msstore" {
+            continue;
+        }
+        let mut id_idx = None;
+        for i in (0..tokens.len() - 1).rev() {
+            let t = tokens[i];
+            if t.contains('.')
+                && t.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '+'
+                })
+                && t.chars().any(|c| c.is_ascii_alphabetic())
+            {
+                id_idx = Some(i);
+                break;
+            }
+        }
+        let Some(idx) = id_idx else { continue };
+        if idx == 0 {
+            continue;
+        }
+        let name = tokens[..idx].join(" ");
+        let current = tokens.get(idx + 1).unwrap_or(&"").to_string();
+        let available = tokens.get(idx + 2).unwrap_or(&"").to_string();
+        fixed.push(Upgradable {
+            winget_id: tokens[idx].to_string(),
+            name,
+            current,
+            available,
+        });
+    }
+    if fixed.is_empty() {
+        Ok(items)
+    } else {
+        Ok(fixed)
+    }
+}
+
+#[tauri::command]
+async fn upgrade_tool(app: AppHandle, winget_id: String, name: String) -> Result<String, String> {
+    validate_id(&winget_id)?;
+    let (ok, log) = run_winget_stream(
+        &app,
+        vec![
+            "upgrade".into(),
+            "--id".into(),
+            winget_id.clone(),
+            "--exact".into(),
+            "--source".into(),
+            "winget".into(),
+            "--accept-package-agreements".into(),
+            "--accept-source-agreements".into(),
+            "--disable-interactivity".into(),
+        ],
+        &winget_id,
+        "upgrade-progress",
+    )
+    .await?;
+
+    if !ok {
+        log_line(
+            &app,
+            "upgrade",
+            &format!("失败 {name}: {}", log.chars().take(500).collect::<String>()),
+        );
+        return Err(format!(
+            "升级 {} 失败: {}",
+            name,
+            summarize(log.as_bytes(), b"")
+        ));
+    }
+    log_line(&app, "upgrade", &format!("完成 {name}"));
+    Ok(format!("{} 已升级", name))
+}
+
+/// 诊断：逐一尝试候选启动方式，报告真正可用的那个路径
+#[tauri::command]
+async fn check_winget(_app: AppHandle) -> Result<String, String> {
+    let mut tried: Vec<String> = Vec::new();
+    for (exe, prefix) in winget_candidates() {
+        let mut cmd = Command::new(&exe);
+        cmd.args(&prefix)
+            .arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null());
+        #[cfg(windows)]
+        {
+            cmd.creation_flags(0x0800_0000);
+        }
+        match cmd.output().await {
+            Ok(out) if out.status.success() => {
+                let ver = decode_output(&out.stdout)
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("winget")
+                    .trim()
+                    .to_string();
+                return Ok(format!("{ver} · {exe}"));
+            }
+            Ok(out) => {
+                let msg = decode_output(&out.stderr);
+                tried.push(format!(
+                    "{exe}（{}）",
+                    msg.trim().chars().take(80).collect::<String>()
+                ));
+            }
+            Err(e) => tried.push(format!("{exe}（{e}）")),
+        }
+    }
+    Err(format!(
+        "winget 不可用，已尝试 {} 种方式：{}",
+        tried.len(),
+        tried.join("；")
+    ))
+}
+
+/// 读取日志（设置页展示 / 导出诊断包）
+#[tauri::command]
+fn read_logs(app: AppHandle, max_lines: Option<usize>) -> Result<String, String> {
+    let Some(dir) = logs_dir(&app) else {
+        return Ok(String::new());
+    };
+    let limit = max_lines.unwrap_or(400);
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("log"))
+        .collect();
+    files.sort();
+    let mut all: Vec<String> = Vec::new();
+    for f in files {
+        if let Ok(text) = std::fs::read_to_string(&f) {
+            all.extend(text.lines().map(|l| l.to_string()));
+        }
+    }
+    if all.len() > limit {
+        all = all.split_off(all.len() - limit);
+    }
+    Ok(all.join("\n"))
+}
+
+/// 导出诊断信息（环境 + 日志），前端负责保存成文件
+#[tauri::command]
+async fn export_diagnostics(app: AppHandle) -> Result<String, String> {
+    let winget = check_winget(app.clone()).await.unwrap_or_else(|e| e);
+    let logs = read_logs(app.clone(), Some(600)).unwrap_or_default();
+    let proxy = get_proxy_state(app.clone())
+        .await
+        .map(|p| {
+            format!(
+                "userProxy={:?} enabled={} winhttp={:?}",
+                p.user_proxy, p.user_proxy_enabled, p.winhttp_proxy
+            )
+        })
+        .unwrap_or_else(|e| e);
+    Ok(format!(
+        "ToolArk {} 诊断包\n时间(UNIX): {}\nOS: {} {}\nwinget: {}\nproxy: {}\n\n==== 日志 ====\n{}",
+        env!("CARGO_PKG_VERSION"),
+        chrono_now(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        winget,
+        proxy,
+        logs
+    ))
+}
+
+// ─────────────────────────────────────────────────────────────
+// 单元测试：纯函数解析
+// ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_id_rejects_injection() {
+        assert!(validate_id("Microsoft.VisualStudioCode").is_ok());
+        assert!(validate_id("a; rm -rf /").is_err());
+        assert!(validate_id("a b").is_err());
+        assert!(validate_id("").is_err());
+    }
+
+    #[test]
+    fn parse_percent_takes_max() {
+        assert_eq!(parse_percent("下载 10%"), Some(10));
+        assert_eq!(parse_percent("10% 然后 88%"), Some(88));
+        assert_eq!(parse_percent("没有百分比"), None);
+        assert_eq!(parse_percent("100.4%"), Some(100));
+    }
+
+    #[test]
+    fn parse_package_table_reads_winget_list() {
+        let out = "\
+Name                          Id                              Version      Available    Source
+---------------------------------------------------------------------------------------------
+Visual Studio Code            Microsoft.VisualStudioCode      1.95.0       1.96.0       winget
+7-Zip 24.09 (x64)             7zip.7zip                       24.09                     winget
+Git                           Git.Git                         2.47.0                    winget
+";
+        let items = parse_package_table(out);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, "Microsoft.VisualStudioCode");
+        assert_eq!(items[0].version, "1.95.0");
+        assert_eq!(items[1].id, "7zip.7zip");
+        assert_eq!(items[1].name, "7-Zip 24.09 (x64)");
+        assert_eq!(items[2].id, "Git.Git");
+    }
+
+    #[test]
+    fn parse_package_table_skips_header_and_short_lines() {
+        assert!(parse_package_table("Name Id Version\n---\n").is_empty());
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        // 单实例必须最先注册：重复启动时聚焦已有窗口，避免两个进程并发写 installed.json
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            install_tool,
+            uninstall_tool,
+            list_installed,
+            persist_installed,
+            scan_installed,
+            open_tool,
+            resolve_app,
+            make_desktop_shortcut,
+            open_url,
+            get_proxy_state,
+            sync_winhttp_proxy,
+            reset_winhttp_proxy,
+            backup_configs,
+            restore_configs,
+            list_upgradable,
+            upgrade_tool,
+            check_winget,
+            read_logs,
+            export_diagnostics
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
