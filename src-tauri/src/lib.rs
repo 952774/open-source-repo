@@ -560,7 +560,11 @@ pub struct AppTarget {
 ///
 /// 文件名带 CACHE_VERSION：解析策略改动后（例如修掉 Git 被定位成 git-lfs.exe），
 /// 老缓存里的错误结果必须作废，否则用户升级后仍然打开错程序。
-const CACHE_VERSION: u32 = 2;
+///
+/// v3：AppTarget 新增 installLocation。v2 写下的条目没有这个字段，
+/// 反序列化后是 None，而命中缓存的判定只要求 exe 存在，
+/// 于是升级到 1.1.x 的用户做安装位置核对时永远拿不到注册表回读值。
+const CACHE_VERSION: u32 = 3;
 
 fn app_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir(app)?.join(format!("app-paths.v{CACHE_VERSION}.json")))
