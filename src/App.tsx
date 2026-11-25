@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { CATEGORIES, BUNDLES, TOOLS, getCategory, type Tool } from './data/tools';
+import { CATEGORIES, BUNDLES, TOOLS, getCategory, type Tool, type Bundle } from './data/tools';
 import { downloadsOf } from './data/downloads';
 import { shotsOf } from './data/shots';
 import { rankByStars, formatDownloads } from './lib/search';
@@ -14,10 +14,16 @@ import {
   syncWinhttpProxy,
   openUrl,
   isTauri,
+  fetchPackageSize,
+  type PackageSize,
 } from './lib/api';
 import { SceneGuide, CompareView, ConfigView, SubmitView } from './components/ExtraViews';
 import { LocalView } from './components/LocalView';
 import { SettingsView, RankView } from './components/Views';
+import { DownloadDock } from './components/DownloadDock';
+import { BundlePanel } from './components/BundlePanel';
+import { requirementsOf } from './lib/requirements';
+import { formatBytes } from './lib/format';
 import pkg from '../package.json';
 
 /** 构建期版本号：与 package.json 保持单一来源，避免底部版本号滞后 */
@@ -255,6 +261,30 @@ function ToolDetailPage({
     : shotsOf(tool.id);
   const related = rankByStars(TOOLS.filter((t) => t.category === tool.category && t.id !== tool.id)).slice(0, 4);
   const dl = downloadsOf(tool.id);
+  const req = requirementsOf(tool);
+
+  // 体积：winget 清单里没有这个字段，只能去问安装器 URL 的 Content-Length。
+  // 查不到就显示「未知」，绝不编一个数字出来。
+  const [pkgSize, setPkgSize] = useState<PackageSize | null>(null);
+  const [sizeBusy, setSizeBusy] = useState(true);
+  useEffect(() => {
+    let alive = true;
+    setSizeBusy(true);
+    setPkgSize(null);
+    void fetchPackageSize(tool.wingetId).then((r) => {
+      if (!alive) return;
+      setPkgSize(r);
+      setSizeBusy(false);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [tool.wingetId]);
+  const sizeText = sizeBusy
+    ? (lang === 'zh' ? '查询中…' : 'Checking…')
+    : pkgSize?.ok && pkgSize.bytes > 0
+      ? formatBytes(pkgSize.bytes)
+      : (lang === 'zh' ? '未知' : 'Unknown');
 
   return (
     <div className="detail-page">
@@ -356,6 +386,17 @@ function ToolDetailPage({
             <span className="v">{dl > 0 ? `📥 ${formatDownloads(dl)}` : '—'}</span>
           </div>
           <div className="meta-row"><span className="k">{T('updated')}</span><span className="v">{lastUpdate ?? '—'}</span></div>
+          <div className="meta-row">
+            <span className="k">{lang === 'zh' ? '安装包体积' : 'Download size'}</span>
+            <span className="v">{sizeText}</span>
+          </div>
+          <div className="meta-row">
+            <span className="k">{lang === 'zh' ? '建议配置' : 'Suggested specs'}</span>
+            <span className="v">
+              {req.ram} RAM · {req.disk}
+              {req.note && <span className="req-note">{req.note}</span>}
+            </span>
+          </div>
           <div className="meta-row"><span className="k">{T('packageId')}</span><span className="v">{tool.wingetId}</span></div>
           <div className="meta-row"><span className="k">{T('repo')}</span><span className="v">{repo ? <a href={repo} target="_blank" rel="noreferrer">GitHub ↗</a> : '—'}</span></div>
           <div className="meta-row"><span className="k">{T('homepage')}</span><span className="v"><a href={tool.homepage} target="_blank" rel="noreferrer">{lang === 'zh' ? '访问 ↗' : 'Open ↗'}</a></span></div>
@@ -444,29 +485,57 @@ function NetworkErrorCard({ message, lang }: { message: string; lang: Lang }) {
   );
 }
 
-function InstallModal({ state, onConfirm, onClose, onLocationChange, onCancelInstall, T, lang }: {
+function InstallModal({ state, onConfirm, onClose, onLocationChange, T, lang }: {
   state: ReturnType<typeof useTools>['install']; onConfirm: () => void; onClose: () => void;
   onLocationChange: (v: string) => void;
-  onCancelInstall: () => void;
   T: (k: StringKey) => string;
   lang: Lang;
 }) {
   const tool = state.tool;
+  // 体积要现查：winget show 不给体积，后端对安装器 URL 发 HEAD 取 Content-Length
+  const [size, setSize] = useState<PackageSize | null>(null);
+  const [sizeLoading, setSizeLoading] = useState(false);
+  useEffect(() => {
+    if (!tool) return;
+    let alive = true;
+    setSizeLoading(true);
+    void fetchPackageSize(tool.wingetId).then((r) => {
+      if (!alive) return;
+      setSize(r);
+      setSizeLoading(false);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [tool]);
+
   if (!tool) return null;
   const phase = state.phase;
   const repo = tool.repo;
+  const zh = lang === 'zh';
+
+  const sizeText = sizeLoading
+    ? (zh ? '查询中…' : 'Checking…')
+    : size?.ok && size.bytes > 0
+      ? formatBytes(size.bytes)
+      : (zh ? '未知' : 'Unknown');
+
   return (
     <>
-      <div className="overlay" onClick={phase === 'installing' ? undefined : onClose} />
+      <div className="overlay" onClick={onClose} />
       <div className="modal">
         <div className="modal-head">
           <span className="mi">{tool.icon}</span>
-          <div><h3>{phase === 'done' ? (T('done')) : phase === 'error' ? 'Error' : phase === 'installing' ? T('installing') : T('installPreview')}</h3><p>{tool.name}</p></div>
+          <div>
+            <h3>{phase === 'done' ? T('done') : phase === 'error' ? 'Error' : T('installPreview')}</h3>
+            <p>{tool.name}</p>
+          </div>
         </div>
         {phase === 'preview' && (
           <>
             <div className="plan">
               <div className="plan-row"><span className="k">✓ Open Source</span><span className="v">{tool.license}</span></div>
+              <div className="plan-row"><span className="k">{zh ? '下载体积' : 'Download size'}</span><span className="v">{sizeText}</span></div>
               <div className="plan-row"><span className="k">{T('repo')}</span><span className="v">{repo ? <a href={repo} target="_blank" rel="noreferrer">GitHub ↗</a> : '—'}</span></div>
               <div className="plan-row"><span className="k">{T('packageId')}</span><span className="v">{tool.wingetId}</span></div>
               <div className="plan-row"><span className="k">Command</span><span className="v">winget install --id {tool.wingetId} --source winget</span></div>
@@ -495,41 +564,14 @@ function InstallModal({ state, onConfirm, onClose, onLocationChange, onCancelIns
               </div>
               <p className="loc-tip">{T('installLocationTip')}</p>
             </div>
-            <div className="notice">✓ 100% 开源软件 · 源码公开可查 · 仅从 winget 可信源安装，不执行任何脚本</div>
+            <div className="notice">
+              {zh
+                ? '✓ 100% 开源软件 · 加入队列后可在后台继续下载，你能接着挑别的软件'
+                : '✓ 100% open source · downloads keep running in the background'}
+            </div>
             <div className="modal-actions">
               <button className="btn-ghost" onClick={onClose}>{T('cancel')}</button>
-              <button className="btn-primary" onClick={onConfirm}>{T('confirmInstall')}</button>
-            </div>
-          </>
-        )}
-        {phase === 'installing' && (
-          <>
-            <div className="progress-track">
-              <div
-                className={`progress-fill${state.percent >= 100 ? ' done' : ''}`}
-                style={{ width: `${Math.max(2, state.percent)}%` }}
-              />
-            </div>
-            <div className="progress-meta">
-              <span>
-                {state.phase_hint === 'download'
-                  ? (lang === 'zh' ? '正在下载…' : 'Downloading…')
-                  : state.phase_hint === 'install'
-                    ? (lang === 'zh' ? '正在安装…' : 'Installing…')
-                    : T('installing')}
-              </span>
-              <b>{state.percent}%</b>
-            </div>
-            {state.message && <div className="progress-text">{state.message}</div>}
-            <div className="modal-actions">
-              <button
-                className="btn-ghost btn-danger"
-                onClick={onCancelInstall}
-                disabled={state.cancelling}
-                title={T('cancelInstallTip')}
-              >
-                {state.cancelling ? T('cancelling') : T('cancelInstall')}
-              </button>
+              <button className="btn-primary" onClick={onConfirm}>{zh ? '加入下载队列' : 'Add to downloads'}</button>
             </div>
           </>
         )}
@@ -722,6 +764,8 @@ export default function App() {
   const setDark = (v: boolean) => updateSetting('dark', v);
   const [extra, setExtra] = useState<ExtraView>('none');
   const [licenseFilter, setLicenseFilter] = useState('all');
+  /** 展开中的套装；null 表示没有 */
+  const [bundleOpen, setBundleOpen] = useState<Bundle | null>(null);
   const [cleanConfig, setCleanConfig] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [appVersion, setAppVersion] = useState(APP_VERSION);
@@ -764,6 +808,14 @@ export default function App() {
       s.checkUpdates();
     }
   }, [s.view, s.isTauri, s.checkUpdates]);
+
+  // 首次启动进场景向导：新用户不知道该装什么，先给三题问卷；
+  // 但只能进一次，否则每次打开都拦在问卷上会烦死人。
+  useEffect(() => {
+    if (settings.firstRunDone) return;
+    setExtra('scene');
+    updateSetting('firstRunDone', true);
+  }, [settings, updateSetting]);
 
   // 启动后静默检查应用更新：有新版本才弹窗，无更新或失败都不打扰
   useEffect(() => {
@@ -864,7 +916,7 @@ export default function App() {
             />
           ) : (
             <>
-          {extra === 'scene' && <SceneGuide t={T} lang={lang} onInstall={(tools) => { s.installTools(tools); setExtra('none'); }} />}
+          {extra === 'scene' && <SceneGuide t={T} lang={lang} onInstall={(tools) => { s.installTools(tools); setExtra('none'); }} onSkip={() => setExtra('none')} />}
           {extra === 'compare' && <CompareView t={T} lang={lang} />}
           {extra === 'config' && <ConfigView t={T} />}
           {extra === 'submit' && <SubmitView t={T} lang={lang} />}
@@ -876,6 +928,9 @@ export default function App() {
               scanning={s.scanningLocal}
               onRescan={() => void s.refreshLocalApps()}
               onPurge={(name) => void s.purgeStaleApp(name)}
+              onForceUninstall={(app) => void s.forceUninstallApp(app)}
+              onCleanCache={() => void s.cleanCache()}
+              cacheBusy={s.cacheBusy}
               onOpenTool={(id) => { const t = TOOLS.find((x) => x.id === id); if (t) openDetail(t); }}
             />
           )}
@@ -893,8 +948,13 @@ export default function App() {
                   <div className="section-head"><h2>⚡ {T('quickBundles')}</h2><span>{T('bundleHint')}</span></div>
                   <div className="bundles">
                     {BUNDLES.map((b) => (
-                      <button className="bundle" key={b.id} disabled={s.loadingBundle !== null} onClick={() => s.installBundle(b.id)}>
-                        <span className="bi">{b.icon}</span><span><span className="bt">{b.name}</span><span className="bd">{s.loadingBundle === b.id ? T('installing') : b.desc}</span></span>
+                      <button className="bundle" key={b.id} onClick={() => setBundleOpen(b)}>
+                        <span className="bi">{b.icon}</span>
+                        <span>
+                          <span className="bt">{b.name}</span>
+                          <span className="bd">{b.desc}</span>
+                        </span>
+                        <span className="bundle-count">{b.toolIds.length}</span>
                       </button>
                     ))}
                   </div>
@@ -991,7 +1051,7 @@ export default function App() {
       </main>
       {sidebarOpen && <div className="sidebar-scrim" onClick={() => setSidebarOpen(false)} />}
 
-      {s.install.phase !== 'idle' && <InstallModal state={s.install} onConfirm={s.confirmInstall} onClose={s.closeInstall} onLocationChange={s.setInstallLocation} onCancelInstall={s.cancelInstall} T={T} lang={lang} />}
+      {s.install.phase !== 'idle' && <InstallModal state={s.install} onConfirm={s.confirmInstall} onClose={s.closeInstall} onLocationChange={s.setInstallLocation} T={T} lang={lang} />}
       {s.uninstallTargets && <UninstallModal tools={s.uninstallTargets} busy={s.uninstalling}
         onConfirm={(clean) => s.doUninstall(clean)} onCancel={s.cancelUninstall}
         cleanConfig={cleanConfig} setCleanConfig={setCleanConfig} T={T} progress={s.uninstallProgress} />}
@@ -1008,7 +1068,24 @@ export default function App() {
           lang={lang}
         />
       )}
+      {bundleOpen && (
+        <BundlePanel
+          bundle={bundleOpen}
+          installed={s.installed}
+          onInstall={(tools) => s.enqueue(tools)}
+          onClose={() => setBundleOpen(null)}
+          lang={lang}
+        />
+      )}
       {s.toast && <div className="toast" onClick={s.closeToast}>{s.toast}</div>}
+      <DownloadDock
+        jobs={s.jobs}
+        onCancel={s.cancelJob}
+        onTogglePause={s.togglePauseJob}
+        onClearFinished={s.clearFinishedJobs}
+        onDismiss={s.dismissJob}
+        lang={lang}
+      />
     </div>
   );
 }

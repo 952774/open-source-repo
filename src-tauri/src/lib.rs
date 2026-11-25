@@ -271,6 +271,8 @@ fn winget_candidates() -> Vec<(String, Vec<String>)> {
 struct RunRegistry {
     pids: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     cancelled: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// 被挂起的任务：winget 与它拉起的安装器整棵进程树都已被 NtSuspendProcess 冻结
+    paused: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 fn register_pid(app: &AppHandle, tool_id: &str, pid: u32) {
@@ -282,6 +284,32 @@ fn register_pid(app: &AppHandle, tool_id: &str, pid: u32) {
 fn unregister_pid(app: &AppHandle, tool_id: &str) {
     if let Ok(mut m) = app.state::<RunRegistry>().pids.lock() {
         m.remove(tool_id);
+    }
+}
+
+fn running_pid(app: &AppHandle, tool_id: &str) -> Option<u32> {
+    app.state::<RunRegistry>()
+        .pids
+        .lock()
+        .ok()
+        .and_then(|m| m.get(tool_id).copied())
+}
+
+fn is_paused(app: &AppHandle, tool_id: &str) -> bool {
+    app.state::<RunRegistry>()
+        .paused
+        .lock()
+        .map(|s| s.contains(tool_id))
+        .unwrap_or(false)
+}
+
+fn set_paused(app: &AppHandle, tool_id: &str, on: bool) {
+    if let Ok(mut s) = app.state::<RunRegistry>().paused.lock() {
+        if on {
+            s.insert(tool_id.to_string());
+        } else {
+            s.remove(tool_id);
+        }
     }
 }
 
@@ -481,6 +509,9 @@ const APP_LOOKUP_PS1: &str = include_str!("app_lookup.ps1");
 const MAKE_SHORTCUT_PS1: &str = include_str!("make_shortcut.ps1");
 const SCAN_LOCAL_PS1: &str = include_str!("scan_local.ps1");
 const PURGE_STALE_PS1: &str = include_str!("purge_stale.ps1");
+const PROC_CTL_PS1: &str = include_str!("proc_ctl.ps1");
+const PKG_SIZE_PS1: &str = include_str!("pkg_size.ps1");
+const FORCE_UNINSTALL_PS1: &str = include_str!("force_uninstall.ps1");
 
 /// 把脚本正文编码成落盘字节：UTF-8 BOM + 正文。
 ///
@@ -507,6 +538,114 @@ fn powershell_exe() -> String {
     // 64 位系统上 System32 里的 Windows PowerShell 一定存在
     let sys = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
     format!("{sys}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+}
+
+/// ToolArk 自己所在的目录。
+///
+/// 这个目录绝对不能让第三方安装器碰：winget 把 `--location` 传给安装器后，
+/// 安装器会把这个目录当成"自己的安装目录"，安装前清理旧文件时会把
+/// toolark.exe / toolark_lib.dll 一起删掉——表现为"装个软件，ToolArk 自己没了"。
+fn self_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.parent().map(|p| p.to_path_buf())
+}
+
+/// 路径归一化：去掉尾部分隔符、统一小写，用于比较。
+fn norm_path(p: &str) -> String {
+    p.trim()
+        .trim_matches('"')
+        .trim_end_matches(['\\', '/'])
+        .replace('/', "\\")
+        .to_lowercase()
+}
+
+/// 系统级目录：安装器会把它们当作自己的根，往里装必然踩到别人的文件。
+const PROTECTED_ROOTS: &[&str] = &[
+    "c:\\windows",
+    "c:\\program files",
+    "c:\\program files (x86)",
+    "c:\\programdata",
+    "c:\\users",
+    "c:\\",
+];
+
+/// 校验用户选的安装目录是否安全。返回 Err 时前端应直接把原因展示给用户。
+fn guard_install_location(location: &str) -> Result<(), String> {
+    let want = norm_path(location);
+
+    // 1) 不能是 ToolArk 自己的目录，也不能是它的子目录
+    if let Some(dir) = self_dir() {
+        let own = norm_path(&dir.to_string_lossy());
+        if !own.is_empty() && (want == own || want.starts_with(&format!("{own}\\"))) {
+            return Err(format!(
+                "不能装到 ToolArk 自己的目录（{}）：安装器会把它当成自己的安装目录，\
+                 清理旧文件时会把 ToolArk 一起删掉。请换一个空目录。",
+                dir.display()
+            ));
+        }
+    }
+
+    // 2) 目标目录里已经躺着 ToolArk 的文件（用户之前把它装在这里）
+    let has_self_files = ["toolark.exe", "toolark_lib.dll"]
+        .iter()
+        .any(|f| Path::new(location).join(f).exists());
+    if has_self_files {
+        return Err(format!(
+            "目录 {location} 里已经有 ToolArk 自己的程序文件，装到这里会互相覆盖。请换一个空目录。"
+        ));
+    }
+
+    // 3) 系统根级目录：安装器会直接铺满这一层
+    if PROTECTED_ROOTS.contains(&want.as_str()) {
+        return Err(format!(
+            "{location} 是系统目录，安装器会把文件直接铺在这一层。请换一个专属子目录，例如 {location}\\软件名。"
+        ));
+    }
+
+    // 4) 非空目录：多数安装器会先清空再装，用户放在里面的东西会一起没
+    if let Ok(entries) = std::fs::read_dir(location) {
+        let count = entries.flatten().count();
+        if count > 0 {
+            // 不是硬错误，只是提示——有些安装器确实会复用已有目录
+            log_line_static(&format!(
+                "安装目录 {location} 非空（{count} 项），安装器可能会清理其中内容"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// 不依赖 AppHandle 的日志（guard 在命令入口处调用，拿不到 app 时也要留痕）
+fn log_line_static(text: &str) {
+    let Ok(base) = std::env::var("APPDATA") else {
+        return;
+    };
+    let dir = Path::new(&base).join("com.toolark.app").join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = stamp / 86_400;
+    let path = dir.join(format!("day-{days}.log"));
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(format!("[{stamp}] [guard] {text}\n").as_bytes());
+    }
+}
+
+/// 安装结束后确认 ToolArk 自己还活着。被安装器清掉时前端要给出明确提示，
+/// 而不是让用户下次启动时才发现程序不见了。
+fn self_intact() -> bool {
+    let Some(dir) = self_dir() else { return true };
+    dir.join("toolark.exe").exists() || dir.join("toolark_lib.dll").exists()
 }
 
 async fn run_ps1(
@@ -792,34 +931,380 @@ async fn purge_stale(app: AppHandle, name: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn cancel_install(app: AppHandle, tool_id: String) -> Result<String, String> {
+async fn cancel_install(app: AppHandle, tool_id: String) -> Result<String, String> {
     validate_id(&tool_id)?;
     if let Ok(mut s) = app.state::<RunRegistry>().cancelled.lock() {
         s.insert(tool_id.clone());
     }
-    let pid = app
-        .state::<RunRegistry>()
-        .pids
-        .lock()
-        .ok()
-        .and_then(|m| m.get(&tool_id).copied());
-    let Some(pid) = pid else {
+    let Some(pid) = running_pid(&app, &tool_id) else {
         return Ok("没有正在进行的安装".into());
     };
-    // /T 连孙进程（msiexec、安装器本体）一起结束，只杀 winget 会留下孤儿安装进程
-    let out = std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .output();
-    let msg = match out {
-        Ok(o) if o.status.success() => format!("已终止安装进程 {pid}"),
-        Ok(o) => format!("终止进程返回 {}", o.status),
-        Err(e) => return Err(format!("终止安装进程失败：{e}")),
+    let was_paused = is_paused(&app, &tool_id);
+    // 挂起状态下也要能杀：TerminateProcess 对冻结进程同样有效，
+    // 但先把标记清掉，免得恢复逻辑在进程已死后还去 NtResumeProcess。
+    set_paused(&app, &tool_id, false);
+
+    // 不用 taskkill /T：它按父进程遍历，父进程一死子进程立刻被系统重新挂载，
+    // 于是 msiexec / Inno Setup 的 setup.exe 变成孤儿继续跑满 CPU 和 GPU。
+    // proc_ctl.ps1 的 kill 分支按「先杀子孙、再杀父」倒序终止，能真正断根。
+    let mut killed = 0usize;
+    let mut detail = String::new();
+    match run_ps1(
+        &app,
+        "proc_ctl.ps1",
+        PROC_CTL_PS1,
+        &[
+            ("TOOLARK_PID", pid.to_string()),
+            ("TOOLARK_ACTION", "kill".to_string()),
+        ],
+    )
+    .await
+    {
+        Ok(out) => {
+            if let Some(v) = last_json(&out) {
+                killed = v.get("count").and_then(|c| c.as_u64()).unwrap_or(0) as usize;
+            }
+        }
+        Err(e) => detail = e,
+    }
+
+    // 兜底：不管上面成没成功，再扫一遍孤儿安装器。
+    // 只认安装器进程名 + 父进程已消失，绝不按资源占用去猜。
+    let swept = sweep_orphans(&app, 0).await.unwrap_or(0);
+
+    if killed == 0 && swept == 0 {
+        // 进程脚本没杀掉任何东西时退回 taskkill，至少别让 winget 活着
+        let out = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .output();
+        if let Ok(o) = out {
+            if o.status.success() {
+                killed = 1;
+            }
+        }
+    }
+
+    let mut msg = if killed > 0 {
+        format!("已终止 {killed} 个安装进程")
+    } else {
+        "安装进程已结束".to_string()
     };
+    if was_paused {
+        msg.push_str("（原本处于暂停状态）");
+    }
+    if swept > 0 {
+        msg.push_str(&format!("，另清理 {swept} 个孤儿安装进程"));
+    }
+    if !detail.is_empty() {
+        msg.push_str(&format!("；进程脚本提示：{detail}"));
+    }
     log_line(&app, "cancel", &format!("{tool_id}: {msg}"));
     Ok(msg)
+}
+
+/// 取脚本输出里最后一个 JSON 对象行。
+fn last_json(out: &str) -> Option<serde_json::Value> {
+    out.lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .and_then(|l| serde_json::from_str(l.trim()).ok())
+}
+
+/// 清掉父进程已消失的安装器孤儿。
+///
+/// 取消安装后 winget 被杀，它拉起的 msiexec / setup.exe 有时会被系统重新挂到
+/// 别的父进程上继续跑——用户看到的就是「点了取消，风扇还在狂转」。
+/// `since` 为 0 表示不按时间过滤。
+async fn sweep_orphans(app: &AppHandle, since: i64) -> Result<usize, String> {
+    let out = run_ps1(
+        app,
+        "proc_ctl.ps1",
+        PROC_CTL_PS1,
+        &[
+            ("TOOLARK_ACTION", "sweep".to_string()),
+            ("TOOLARK_SINCE", since.to_string()),
+        ],
+    )
+    .await?;
+    let v = last_json(&out).ok_or_else(|| "进程清理脚本没有返回数据".to_string())?;
+    Ok(v.get("count").and_then(|c| c.as_u64()).unwrap_or(0) as usize)
+}
+
+/// 供前端手动触发：清理上次异常退出留下的安装器孤儿。
+#[tauri::command]
+async fn clean_orphan_installers(app: AppHandle) -> Result<String, String> {
+    let n = sweep_orphans(&app, 0).await?;
+    let msg = if n > 0 {
+        format!("已清理 {n} 个孤儿安装进程")
+    } else {
+        "没有发现残留的安装进程".to_string()
+    };
+    log_line(&app, "sweep", &msg);
+    Ok(msg)
+}
+
+/// 暂停 / 继续安装。
+///
+/// 不用"杀进程再重下"：winget 没有断点续传的公开接口，杀掉就等于丢掉已下载的
+/// 部分，用户点了暂停再继续会从 0% 开始，比不暂停还慢。这里用 NtSuspendProcess
+/// 冻结整棵进程树（winget + 安装器 + 安装器的子进程），内存与已下载字节全部保留。
+#[tauri::command]
+async fn pause_install(app: AppHandle, tool_id: String, paused: bool) -> Result<String, String> {
+    validate_id(&tool_id)?;
+    let Some(pid) = running_pid(&app, &tool_id) else {
+        return Err("没有正在进行的安装".into());
+    };
+    let action = if paused { "suspend" } else { "resume" };
+    let out = run_ps1(
+        &app,
+        "proc_ctl.ps1",
+        PROC_CTL_PS1,
+        &[
+            ("TOOLARK_PID", pid.to_string()),
+            ("TOOLARK_ACTION", action.to_string()),
+        ],
+    )
+    .await?;
+    let line = out
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .ok_or_else(|| "进程控制脚本没有返回数据".to_string())?;
+    let v: serde_json::Value =
+        serde_json::from_str(line.trim()).map_err(|e| format!("解析进程控制结果失败: {e}"))?;
+    let count = v.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
+    if count == 0 {
+        return Err(format!(
+            "{}失败：没有找到可控制的进程（可能已经结束）",
+            if paused { "暂停" } else { "继续" }
+        ));
+    }
+    set_paused(&app, &tool_id, paused);
+    log_line(
+        &app,
+        "pause",
+        &format!("{tool_id}: {action} 冻结/恢复 {count} 个进程"),
+    );
+    Ok(format!(
+        "{}{} {count} 个进程",
+        if paused { "已暂停" } else { "已继续" },
+        if paused { "，" } else { "" }
+    ))
+}
+
+#[derive(serde::Serialize)]
+pub struct PackageSize {
+    ok: bool,
+    bytes: u64,
+    url: String,
+    note: String,
+}
+
+/// 查一个 winget 包的安装器体积。
+///
+/// `winget show` 只给"安装程序 URL"，没有体积字段；manifest 里也没有 Size。
+/// 所以只能对安装器 URL 发 HEAD 拿 Content-Length —— 这也正好是用户真正要下载的字节数。
+#[tauri::command]
+async fn fetch_package_size(app: AppHandle, winget_id: String) -> Result<PackageSize, String> {
+    validate_id(&winget_id)?;
+    let out = run_ps1(
+        &app,
+        "pkg_size.ps1",
+        PKG_SIZE_PS1,
+        &[("TOOLARK_WINGET_ID", winget_id.clone())],
+    )
+    .await?;
+    let line = out
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .ok_or_else(|| "体积探测脚本没有返回数据".to_string())?;
+    let v: serde_json::Value =
+        serde_json::from_str(line.trim()).map_err(|e| format!("解析体积结果失败: {e}"))?;
+    Ok(PackageSize {
+        ok: v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false),
+        bytes: v.get("bytes").and_then(|b| b.as_u64()).unwrap_or(0),
+        url: v
+            .get("url")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        note: v
+            .get("note")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct ForceUninstallResult {
+    ok: bool,
+    steps: Vec<serde_json::Value>,
+    removed: u64,
+    errors: Vec<String>,
+}
+
+/// 强力卸载：进程 → 卸载器 → ARP 注册表 → 残留目录 → 快捷方式。
+///
+/// 走 winget uninstall 时，只要安装器本身坏了（0x800401f5 Application not found、
+/// 文件被手工删过、ARP 键指向不存在的卸载器），winget 就彻底没辙。这条路不依赖
+/// 安装器是否完好，按 Windows 卸载的实际组成逐项清理。
+#[tauri::command]
+async fn force_uninstall(
+    app: AppHandle,
+    name: String,
+    exe: Option<String>,
+    location: Option<String>,
+    uninstall_string: Option<String>,
+    dry_run: Option<bool>,
+) -> Result<ForceUninstallResult, String> {
+    if name.trim().is_empty() || name.len() > 200 {
+        return Err("无效的软件名".into());
+    }
+    let out = run_ps1(
+        &app,
+        "force_uninstall.ps1",
+        FORCE_UNINSTALL_PS1,
+        &[
+            ("TOOLARK_NAME", name.clone()),
+            ("TOOLARK_EXE", exe.unwrap_or_default()),
+            ("TOOLARK_LOCATION", location.unwrap_or_default()),
+            ("TOOLARK_UNINSTALL", uninstall_string.unwrap_or_default()),
+            (
+                "TOOLARK_DRY",
+                if dry_run.unwrap_or(false) { "1" } else { "0" }.to_string(),
+            ),
+        ],
+    )
+    .await?;
+    let line = out
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .ok_or_else(|| "强力卸载脚本没有返回数据".to_string())?;
+    let v: serde_json::Value =
+        serde_json::from_str(line.trim()).map_err(|e| format!("解析卸载结果失败: {e}"))?;
+    let steps = v
+        .get("steps")
+        .and_then(|s| s.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let errors: Vec<String> = v
+        .get("errors")
+        .and_then(|s| s.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let removed = v.get("removed").and_then(|r| r.as_u64()).unwrap_or(0);
+    log_line(
+        &app,
+        "force-uninstall",
+        &format!("{name}: removed={removed} steps={} errors={}", steps.len(), errors.join("|")),
+    );
+    Ok(ForceUninstallResult {
+        ok: v.get("ok").and_then(|b| b.as_bool()).unwrap_or(false),
+        steps,
+        removed,
+        errors,
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct CacheCleanResult {
+    files: u64,
+    bytes: u64,
+    dirs: Vec<String>,
+}
+
+/// 清理 winget 的下载缓存。
+///
+/// winget 把安装器下载到 `%LOCALAPPDATA%\Packages\Microsoft.DesktopAppInstaller_*\LocalState\Temp`
+/// 之后就不再管它。一个 2 GB 的包被取消、失败、或者反复重试几次，这里能堆出十几 GB。
+/// 用户点"清理下载残留"时要的正是这个目录，而不是再去翻资源管理器。
+#[tauri::command]
+async fn clean_download_cache(app: AppHandle) -> Result<CacheCleanResult, String> {
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    if local.is_empty() {
+        return Err("找不到 LOCALAPPDATA".into());
+    }
+    let packages = Path::new(&local).join("Packages");
+    let Ok(entries) = std::fs::read_dir(&packages) else {
+        return Ok(CacheCleanResult { files, bytes, dirs });
+    };
+
+    // 只清 DesktopAppInstaller 自己的 Temp，别碰别的应用的缓存
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("Microsoft.DesktopAppInstaller_") {
+            continue;
+        }
+        let temp = entry.path().join("LocalState").join("Temp");
+        if !temp.is_dir() {
+            continue;
+        }
+        let Ok(items) = std::fs::read_dir(&temp) else { continue };
+        for item in items.flatten() {
+            let path = item.path();
+            let size = if path.is_file() {
+                item.metadata().map(|m| m.len()).unwrap_or(0)
+            } else {
+                dir_size(&path)
+            };
+            let removed = if path.is_dir() {
+                std::fs::remove_dir_all(&path).is_ok()
+            } else {
+                std::fs::remove_file(&path).is_ok()
+            };
+            if removed {
+                files += 1;
+                bytes += size;
+                if dirs.len() < 20 {
+                    dirs.push(path.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+
+    log_line(
+        &app,
+        "cache",
+        &format!("清理下载缓存 {files} 项 / {bytes} 字节"),
+    );
+    Ok(CacheCleanResult { files, bytes, dirs })
+}
+
+/// 只清 winget 下载缓存，返回释放的字节数（内部复用，不写日志）。
+///
+/// 安装被取消/失败后调用：几百 MB 到几 GB 的安装包会一直躺在 Temp 里。
+async fn clean_installer_temp(app: &AppHandle) -> Result<u64, String> {
+    let r = clean_download_cache(app.clone()).await?;
+    Ok(r.bytes)
+}
+
+/// 递归统计目录体积（只用于报数，失败就返回 0）
+fn dir_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
+    let mut total = 0u64;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            total += dir_size(&p);
+        } else {
+            total += e.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    total
 }
 
 #[tauri::command]
@@ -852,6 +1337,8 @@ async fn install_tool(
         {
             return Err(format!("安装路径无效：{loc}"));
         }
+        // 关键防线：装进 ToolArk 自己所在目录会把 ToolArk 一起删掉
+        guard_install_location(loc)?;
         if !Path::new(loc).exists() {
             std::fs::create_dir_all(loc).map_err(|e| format!("无法创建安装目录 {loc}: {e}"))?;
         }
@@ -933,13 +1420,26 @@ async fn install_tool(
         )
         .await?;
         clear_cancel(&app, &tool_id);
+
+        // 中断后必须把安装器孤儿清干净：winget 被杀了，它拉起的 msiexec /
+        // setup.exe 会被系统重新挂到别的父进程下继续跑，风扇一直转。
+        let swept = sweep_orphans(&app, 0).await.unwrap_or(0);
+        // 下载到一半的安装包留在 winget 的 Temp 里，几百 MB 起步，一并清掉。
+        let freed = clean_installer_temp(&app).await.unwrap_or(0);
+
         // 用户主动取消不是"失败"，不要拿 winget 的堆栈去糊用户一脸
         if was_cancelled {
-            return Err(format!(
-                "已取消 {} 的安装{}",
-                name,
-                if rolled { "，残留已清理" } else { "" }
-            ));
+            let mut tail = String::new();
+            if rolled {
+                tail.push_str("，已回滚");
+            }
+            if swept > 0 {
+                tail.push_str(&format!("，清理 {swept} 个残留进程"));
+            }
+            if freed > 0 {
+                tail.push_str(&format!("，释放 {} MB 下载残留", freed / 1024 / 1024));
+            }
+            return Err(format!("已取消 {} 的安装{}", name, tail));
         }
         let suffix = if rolled {
             "；已自动回滚清理残留"
@@ -1003,6 +1503,17 @@ async fn install_tool(
             "位置核对 {name}: 请求={location:?} 实际={actual_location:?} used_location={used_location}"
         ),
     );
+
+    // 装完之后确认 ToolArk 自己没被安装器清掉。有 guard_install_location 拦着
+    // 正常情况下不会发生，但安装器可能自己往别处写、或用户改了安装器内部路径，
+    // 这里兜底：一旦发现自己的文件不见了，立刻在结果里说清楚，而不是等下次启动。
+    if !self_intact() {
+        log_line(&app, "guard", &format!("安装 {name} 后 ToolArk 自身文件缺失"));
+        notes.push(
+            "警告：本次安装后 ToolArk 自己的程序文件已不在原位置，请重新安装 ToolArk"
+                .into(),
+        );
+    }
 
     Ok(format!("{} 安装成功（{}）", name, notes.join("；")))
 }
@@ -1944,11 +2455,27 @@ Microsoft Visual C++ 2015 UWP Desktop Runtime Package        Microsoft.VCLibs.De
         assert!(rest.contains("Write-Output 1"));
     }
 
-    /// 内嵌的两个 PS1 脚本都必须含中文（否则 BOM 问题不会显现，测试也就失去意义）。
+    /// 内嵌的 PS1 脚本都必须含中文（否则 BOM 问题不会显现，测试也就失去意义）。
+    ///
+    /// 这几个脚本全靠 `winget show` 的中文输出做正则匹配，一旦哪天把中文注释与
+    /// 中文标签删干净，`script_bytes` 的 BOM 兜底就没人验证了，线上会直接坏掉。
     #[test]
     fn embedded_scripts_contain_cjk() {
-        assert!(APP_LOOKUP_PS1.chars().any(|c| c as u32 > 0x2E80));
-        assert!(MAKE_SHORTCUT_PS1.chars().any(|c| c as u32 > 0x2E80));
+        let all = [
+            ("app_lookup.ps1", APP_LOOKUP_PS1),
+            ("make_shortcut.ps1", MAKE_SHORTCUT_PS1),
+            ("scan_local.ps1", SCAN_LOCAL_PS1),
+            ("purge_stale.ps1", PURGE_STALE_PS1),
+            ("proc_ctl.ps1", PROC_CTL_PS1),
+            ("pkg_size.ps1", PKG_SIZE_PS1),
+            ("force_uninstall.ps1", FORCE_UNINSTALL_PS1),
+        ];
+        for (name, body) in all {
+            assert!(
+                body.chars().any(|c| c as u32 > 0x2E80),
+                "{name} 里必须保留中文，否则 BOM 编码问题不会被测出来"
+            );
+        }
     }
 
     /// 注册表回读值必须决定提示文案，不能靠 winget 退出码臆断"已装到自定义位置"。
@@ -2019,7 +2546,12 @@ pub fn run() {
             read_logs,
             export_diagnostics,
             scan_local_apps,
-            purge_stale
+            purge_stale,
+            pause_install,
+            fetch_package_size,
+            force_uninstall,
+            clean_download_cache,
+            clean_orphan_installers
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

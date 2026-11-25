@@ -10,6 +10,7 @@ import { useMemo, useState } from 'react';
 import type { LocalApp } from '../lib/api';
 import { openUrl } from '../lib/api';
 import { buildLocalIndex, matchLocalApp } from '../lib/localMatch';
+import { formatBytes } from '../lib/format';
 import type { Lang } from '../lib/i18n';
 
 type Filter = 'all' | 'oss' | 'stale';
@@ -20,11 +21,16 @@ interface Props {
   scanning: boolean;
   onRescan: () => void;
   onPurge: (name: string) => void;
+  /** 强力卸载：结束进程 + 调卸载器 + 清 ARP + 删残留目录 + 清快捷方式 */
+  onForceUninstall: (app: LocalApp) => void;
+  /** 清 winget 下载缓存 */
+  onCleanCache?: () => void;
+  cacheBusy?: boolean;
   /** 点「在 ToolArk 里查看」时跳到对应详情页 */
   onOpenTool: (toolId: string) => void;
 }
 
-export function LocalView({ lang, apps, scanning, onRescan, onPurge, onOpenTool }: Props) {
+export function LocalView({ lang, apps, scanning, onRescan, onPurge, onForceUninstall, onCleanCache, cacheBusy, onOpenTool }: Props) {
   const zh = lang === 'zh';
   const [filter, setFilter] = useState<Filter>('all');
   const [q, setQ] = useState('');
@@ -72,6 +78,12 @@ export function LocalView({ lang, apps, scanning, onRescan, onPurge, onOpenTool 
         <button className="btn-ghost btn-sm" disabled={scanning} onClick={onRescan}>
           {scanning ? (zh ? '扫描中…' : 'Scanning…') : (zh ? '🔄 重新扫描' : '🔄 Rescan')}
         </button>
+        {onCleanCache && (
+          <button className="btn-ghost btn-sm" disabled={cacheBusy} onClick={onCleanCache}
+            title={zh ? '清掉 winget 下载目录里的安装包缓存，不影响已装软件' : 'Clears winget download cache; installed apps are untouched'}>
+            {cacheBusy ? (zh ? '清理中…' : 'Cleaning…') : (zh ? '🧹 清理下载缓存' : '🧹 Clean cache')}
+          </button>
+        )}
       </div>
 
       <div className="local-toolbar">
@@ -146,6 +158,15 @@ export function LocalView({ lang, apps, scanning, onRescan, onPurge, onOpenTool 
                         {zh ? '官网 ↗' : 'Site ↗'}
                       </button>
                     )}
+                    <button
+                      className="btn-ghost btn-danger btn-sm"
+                      onClick={() => onForceUninstall(app)}
+                      title={zh
+                        ? '强制结束占用进程 → 调卸载器 → 清注册表条目 → 删残留目录 → 清快捷方式'
+                        : 'Kills holding processes → runs the uninstaller → clears registry entries → removes leftover files → cleans shortcuts'}
+                    >
+                      {zh ? '强力卸载' : 'Force uninstall'}
+                    </button>
                   </>
                 )}
               </div>

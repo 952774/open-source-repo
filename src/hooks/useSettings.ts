@@ -9,6 +9,8 @@ export interface AppSettings {
   defaultLocation: string;
   /** 安装完成后自动关闭弹窗 */
   autoCloseAfterInstall: boolean;
+  /** 是否已经走过（或跳过）首次启动的场景向导 */
+  firstRunDone: boolean;
 }
 
 const STORAGE_KEY = 'toolark-settings';
@@ -18,6 +20,7 @@ const DEFAULTS: AppSettings = {
   dark: false,
   defaultLocation: '',
   autoCloseAfterInstall: false,
+  firstRunDone: false,
 };
 
 function load(): AppSettings {

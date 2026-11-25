@@ -2,6 +2,91 @@
 
 本项目遵循语义化版本。清单（tools.ts）的增删不计入版本号，随发布一起更新。
 
+## v1.3.0 — 2026-11-25
+
+这一版是安装流程的整体重做：安装不再占着模态框，进度搬到常驻底栏，可以暂停、继续、取消，
+而最要命的一条——**装别的软件会把 ToolArk 自己删掉**——也在这里堵住了。
+
+### 修：安装失败后 ToolArk 自己消失了（最严重）
+
+现象：在 ToolArk 里装 OpenShot，装完 `E:\AI软件测试\toolark.exe` 和 `toolark_lib.dll`
+都不见了，只剩一堆 OpenShot 的文件；但注册表里 ToolArk 还标着 1.2.3 已安装。
+
+原因：`E:\AI软件测试\` 同时是 ToolArk 自己的安装目录，又是 ToolArk 的默认安装位置。
+winget 调起 OpenShot 的 Inno Setup 安装器后，安装器把这个目录当成"自己的地盘"，
+清理旧版本时按自己的文件清单删了一遍——ToolArk 的两个文件就在清单之外，被一起清掉了。
+
+现在装任何东西之前先过四道检查：目标目录等于或位于 ToolArk 自己所在目录 → 拒绝；
+目标目录里已经有 `toolark.exe` / `toolark_lib.dll` → 拒绝；命中系统目录
+（`C:\Windows`、`Program Files`、`ProgramData`、`Users`、盘根）→ 拒绝并要求建专属子目录；
+其余情况允许但留日志。安装完成后还会回查一次自己的文件是否还在，不在就在结果里警告。
+
+### 新增：后台下载队列
+
+安装从模态框里搬出来，进入右下角的「正在下载」面板（`.dock`）。加进队列就能继续挑别的软件，
+面板显示每个包的圆环进度、当前阶段（下载 / 安装）、暂停与取消按钮。
+
+队列是**串行**的：winget 对 msiexec 是独占的，并发装两个会直接报 `0x800700aa`（资源忙）。
+暂停中的项也不会让队列往下走——暂停只是冻结进程，文件锁和独占还握着，此时开下一个必炸。
+
+### 新增：macOS 圆环进度
+
+`ProgressRing` 用 SVG 画，`stroke-dasharray` + `stroke-dashoffset` 走 CSS 过渡，
+不占主线程也不吃 GPU。折叠头是 30px 的总进度环，列表每项 34px；暂停时环变灰并显示 ❚❚，
+完成显示 ✓，失败显示 !。
+
+### 新增：暂停 / 继续 / 取消安装
+
+暂停不是挂起 winget 一个进程——真正在下载和解包的是它拉起的 msiexec / Inno Setup / NSIS。
+`proc_ctl.ps1` 用 `NtSuspendProcess` 冻结**整棵进程树**（按 `ParentProcessId` 做 BFS，
+上限 512 个），继续时 `NtResumeProcess` 原样放开，已下载的字节全部保留。
+
+取消走 `kill` 动作，倒序终止（先子孙后父，否则父一死子进程会被系统重新挂载就找不到了）。
+之后还会 `sweep` 一遍孤儿安装进程——只认 `msiexec` / `setup` / `install` / `unins000` /
+`winget` / `dpinst` 这几个名字，且父进程已不在的才算，绝不按"占用高"去猜，那会误杀用户自己的程序。
+最后清掉 winget 的 Temp 目录里下了一半的安装包。
+
+### 新增：强力卸载 + 清理注册表
+
+「本机软件」每行多了「强力卸载」按钮，走五步：结束占用进程 → 调卸载器（msiexec 补
+`/qn /norestart`，exe 补 `/S`）→ 清 ARP 三个根（HKLM、WOW6432Node、HKCU）里 DisplayName
+或 InstallLocation 对得上的条目 → 删残留目录（仅当递归两层内没有 `*.exe`）→ 清开始菜单与
+桌面快捷方式。每步的执行结果都会回显，删了几项注册表也写清楚。
+
+另有「清理下载缓存」按钮，扫 `%LOCALAPPDATA%\Packages\Microsoft.DesktopAppInstaller_*`
+下的 `LocalState\Temp`，只删安装包不动已装软件。
+
+### 新增：详情页显示安装包体积与建议配置
+
+`winget show` 不给体积，后端对安装器 URL 发 `HEAD` 取 `Content-Length`（失败再用
+`Range: bytes=0-0` 解 `Content-Range`），先查本地 winget 缓存命中就直接读文件大小。
+实测 OpenShot 248 MB、Git 66.9 MB。建议配置按分类给基线，命中 `blender` / `ollama` /
+`visual studio` 这类重负载关键词时抬档。
+
+### 新增：快速套装二级菜单
+
+点套装不再直接全装，而是弹出面板列出包含的软件，默认勾选未安装的那些，可以全选 / 全不选 /
+逐个挑，底部按钮显示「加入队列（n）」。
+
+### 新增：首次启动进场景向导，可跳过
+
+第一次打开先走三题问卷（用途 / 习惯 / 优先），选完给推荐清单。每屏右下角都有
+「跳过，我自己挑 →」，不想答就直接回主列表。`firstRunDone` 存进设置，只拦一次。
+
+### 清理
+
+删掉 21 个已无引用的 CSS 类（`.drawer` 系列 16 处、`.glass`、`.foot-controls`、
+`.detail-section`、`.highlight-*`、`.related-grid`、`.shot-grid`、`.verified-badge`、
+`.dsec`、`.btn-install`、`.btn-launch` 等），以及 `.progress` 无限跑马灯。
+修掉两个用了不存在变量的地方：圆环的 `var(--danger)` / `var(--ok)`（实际定义的是
+`--red` / `--green`，写错会让整圈变成透明）、套装「已安装」标签的 `var(--ok)`。
+
+### 测试
+
+`cargo test --lib` 9 passed；`npm test` 17 passed。`embedded_scripts_contain_cjk`
+从只查 2 个脚本扩到全部 7 个——这几个脚本靠 `winget show` 的中文输出做正则匹配，
+中文一旦被删干净，BOM 兜底就没人验证了。
+
 ## v1.2.3 — 2026-11-25
 
 上一版把分类折叠了，但侧栏底部还是被挤出去——这一版把导航区和底部区拆开，设置入口彻底固定。

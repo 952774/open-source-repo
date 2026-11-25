@@ -28,11 +28,12 @@ const CATEGORY_EN: Record<string, string> = {
 const catLabel = (id: string, name: string, lang: Lang) => (lang === 'zh' ? name : (CATEGORY_EN[id] ?? name));
 
 /* ---------- F2 场景向导 ---------- */
-export function SceneGuide({ t, lang, onInstall }: { t: TFunc; lang: Lang; onInstall: (tools: Tool[]) => void }) {
+export function SceneGuide({ t, lang, onInstall, onSkip }: { t: TFunc; lang: Lang; onInstall: (tools: Tool[]) => void; onSkip?: () => void }) {
   const [step, setStep] = useState(0);
   const [picks, setPicks] = useState<string[]>([]);
   const q = SCENE_QUESTIONS[step];
   const done = step >= SCENE_QUESTIONS.length;
+  const zh = lang === 'zh';
 
   const toggle = (toolIds: string[]) => {
     setPicks((prev) => {
@@ -44,10 +45,18 @@ export function SceneGuide({ t, lang, onInstall }: { t: TFunc; lang: Lang; onIns
 
   const recommended = picks.map((id) => TOOLS.find((x) => x.id === id)).filter(Boolean) as Tool[];
 
+  // 首启动会自动进这个页面。有人就是想自己翻列表，不给出口等于强制问卷，
+  // 所以每一步都要有「跳过」，跳过后直接回全部工具。
+  const skipBtn = onSkip ? (
+    <button className="scene-skip" onClick={onSkip} title={zh ? '不看推荐，直接浏览全部工具' : 'Skip and browse all tools'}>
+      {zh ? '跳过，我自己挑' : 'Skip — I’ll browse myself'} →
+    </button>
+  ) : null;
+
   if (done) {
     return (
       <div className="extra-view">
-        <div className="section-head"><h2>✨ {t('sceneNext')}</h2><span>{recommended.length} {lang === 'zh' ? '款推荐工具' : 'recommended'}</span></div>
+        <div className="section-head"><h2>✨ {t('sceneNext')}</h2><span>{recommended.length} {zh ? '款推荐工具' : 'recommended'}</span></div>
         <div className="grid">
           {recommended.map((tool) => (
             <div className="tool-card" key={tool.id}>
@@ -63,6 +72,7 @@ export function SceneGuide({ t, lang, onInstall }: { t: TFunc; lang: Lang; onIns
           <button className="btn-ghost" onClick={() => { setStep(0); setPicks([]); }}>{t('sceneBack')}</button>
           <button className="btn-primary" onClick={() => onInstall(recommended)}>{t('sceneDone')}（{recommended.length}）</button>
         </div>
+        {skipBtn && <div className="scene-skip-wrap">{skipBtn}</div>}
       </div>
     );
   }
@@ -71,19 +81,22 @@ export function SceneGuide({ t, lang, onInstall }: { t: TFunc; lang: Lang; onIns
     <div className="extra-view">
       <div className="scene-head">
         <div className="scene-step">STEP {step + 1} / {SCENE_QUESTIONS.length}</div>
-        <h2>{lang === 'zh' ? q.question : q.questionEn}</h2>
+        <h2>{zh ? q.question : q.questionEn}</h2>
         <p>{t('sceneHint')}</p>
       </div>
       <div className="scene-options">
         {q.options.map((opt) => (
           <button className="scene-option" key={opt.id} onClick={() => { toggle(opt.toolIds); setStep(step + 1); }}>
             <span className="so-icon">{opt.icon}</span>
-            <span className="so-label">{lang === 'zh' ? opt.label : opt.labelEn}</span>
+            <span className="so-label">{zh ? opt.label : opt.labelEn}</span>
             <span className="so-arrow">→</span>
           </button>
         ))}
       </div>
-      {step > 0 && <button className="btn-ghost" onClick={() => setStep(step - 1)}>{t('sceneBack')}</button>}
+      <div className="scene-foot">
+        {step > 0 && <button className="btn-ghost" onClick={() => setStep(step - 1)}>{t('sceneBack')}</button>}
+        {skipBtn}
+      </div>
     </div>
   );
 }

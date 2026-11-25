@@ -94,6 +94,17 @@ export async function cancelInstall(toolId: string): Promise<CommandResult> {
   }
 }
 
+/** 清理上次异常退出留下的孤儿安装进程（msiexec / setup.exe 等） */
+export async function cleanOrphanInstallers(): Promise<CommandResult> {
+  if (!isTauri()) return { ok: false, message: '仅桌面版可执行' };
+  try {
+    const message = await invoke<string>('clean_orphan_installers');
+    return { ok: true, message };
+  } catch (err) {
+    return { ok: false, message: String(err) };
+  }
+}
+
 /** 打开系统目录选择器（仅桌面版；浏览器返回 null） */
 export async function pickInstallDirectory(): Promise<string | null> {
   if (!isTauri()) return null;
@@ -101,6 +112,100 @@ export async function pickInstallDirectory(): Promise<string | null> {
     const { open } = await import('@tauri-apps/plugin-dialog');
     const picked = await open({ directory: true, multiple: false, title: '选择安装位置' });
     return typeof picked === 'string' ? picked : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 暂停 / 继续正在进行的安装。
+ *
+ * 后端用 NtSuspendProcess 冻结整棵进程树（winget + 安装器 + 安装器的子进程），
+ * 已下载的字节与内存都保留，继续时原地恢复，不从 0% 重来。
+ */
+export async function pauseInstall(
+  toolId: string,
+  paused: boolean,
+): Promise<CommandResult> {
+  if (!isTauri()) return { ok: false, message: '仅桌面版可暂停' };
+  try {
+    const message = await invoke<string>('pause_install', { toolId, paused });
+    return { ok: true, message };
+  } catch (err) {
+    return { ok: false, message: String(err) };
+  }
+}
+
+/** 安装器体积探测结果 */
+export interface PackageSize {
+  ok: boolean;
+  bytes: number;
+  url: string;
+  note: string;
+}
+
+/**
+ * 查一个包要下载多少字节。
+ * winget show 只有安装器 URL、没有体积字段，后端对 URL 发 HEAD 取 Content-Length。
+ */
+export async function fetchPackageSize(wingetId: string): Promise<PackageSize | null> {
+  if (!isTauri() || !wingetId) return null;
+  try {
+    return await invoke<PackageSize>('fetch_package_size', { wingetId });
+  } catch {
+    return null;
+  }
+}
+
+export interface ForceUninstallStep {
+  text: string;
+  done: boolean;
+  detail: string;
+}
+
+export interface ForceUninstallResult {
+  ok: boolean;
+  steps: ForceUninstallStep[];
+  removed: number;
+  errors: string[];
+}
+
+/**
+ * 强力卸载：不依赖安装器是否完好。
+ * 按 Windows 卸载的实际组成逐项清理：进程 → 卸载器 → ARP 注册表 → 残留目录 → 快捷方式。
+ */
+export async function forceUninstall(input: {
+  name: string;
+  exe?: string | null;
+  location?: string | null;
+  uninstallString?: string | null;
+  dryRun?: boolean;
+}): Promise<ForceUninstallResult | null> {
+  if (!isTauri()) return null;
+  try {
+    return await invoke<ForceUninstallResult>('force_uninstall', {
+      name: input.name,
+      exe: input.exe ?? null,
+      location: input.location ?? null,
+      uninstallString: input.uninstallString ?? null,
+      dryRun: input.dryRun ?? false,
+    });
+  } catch {
+    return null;
+  }
+}
+
+export interface CacheCleanResult {
+  files: number;
+  bytes: number;
+  dirs: string[];
+}
+
+/** 清理 winget 下载缓存（取消/失败留下的安装器包，单个可能上 GB） */
+export async function cleanDownloadCache(): Promise<CacheCleanResult | null> {
+  if (!isTauri()) return null;
+  try {
+    return await invoke<CacheCleanResult>('clean_download_cache');
   } catch {
     return null;
   }
