@@ -16,6 +16,7 @@ import {
   isTauri,
   fetchPackageSize,
   type PackageSize,
+  type LocalApp,
 } from './lib/api';
 import { SceneGuide, CompareView, ConfigView, SubmitView } from './components/ExtraViews';
 import { LocalView } from './components/LocalView';
@@ -634,6 +635,60 @@ function UninstallModal({ tools, busy, onConfirm, onCancel, cleanConfig, setClea
 }
 
 /**
+ * 强力卸载确认弹窗
+ *
+ * 这个动作会结束进程、调卸载器、删注册表、删目录、删快捷方式，
+ * 一旦点错没法撤销，所以必须先让用户看清楚要动哪些东西再确认。
+ * 原来点了直接执行，风险太大。
+ */
+function ForceUninstallModal({ app, busy, onConfirm, onClose, lang }: {
+  app: LocalApp; busy: boolean; onConfirm: () => void; onClose: () => void; lang: Lang;
+}) {
+  const zh = lang === 'zh';
+  const steps = zh
+    ? ['结束占用这个程序的进程', '调用它自己的卸载程序', '清理卸载注册表条目', '删除没有程序文件的残留目录', '清理开始菜单与桌面快捷方式']
+    : ['Stop processes holding this program', 'Run its own uninstaller', 'Clear uninstall registry entries', 'Remove leftover folders with no executables', 'Clean Start menu and desktop shortcuts'];
+  return (
+    <>
+      <div className="overlay" onClick={busy ? undefined : onClose} />
+      <div className="modal">
+        <div className="modal-head">
+          <span className="mi">⚠️</span>
+          <div>
+            <h3>{zh ? '强力卸载' : 'Force uninstall'}</h3>
+            <p>{app.name}{app.version ? ` ${app.version}` : ''}</p>
+          </div>
+        </div>
+        <div className="notice warn">
+          {zh
+            ? '普通卸载失败时才用这个。它会按顺序做下面五件事，做完无法撤销。'
+            : 'Use this only when the normal uninstall fails. It does the five things below in order, and cannot be undone.'}
+        </div>
+        <ul className="force-steps">
+          {steps.map((s, i) => <li key={s}><b>{i + 1}</b><span>{s}</span></li>)}
+        </ul>
+        {app.installLocation && (
+          <p className="loc-tip" style={{ marginTop: 10 }}>
+            {zh ? '安装目录：' : 'Install folder: '}<code>{app.installLocation}</code>
+          </p>
+        )}
+        <p className="loc-tip" style={{ marginTop: 8 }}>
+          {zh
+            ? '目录里如果还有可执行文件，会保留不删——避免误删你后来放进去的东西。'
+            : 'If the folder still contains executables it is kept, so nothing you added later gets deleted.'}
+        </p>
+        <div className="modal-actions">
+          <button className="btn-ghost" onClick={onClose} disabled={busy}>{zh ? '取消' : 'Cancel'}</button>
+          <button className="btn-danger" onClick={onConfirm} disabled={busy}>
+            {busy ? (zh ? '正在卸载…' : 'Uninstalling…') : (zh ? '确认强力卸载' : 'Force uninstall')}
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+/**
  * 安装残留处置弹窗
  *
  * 打开失败但注册表里还留着条目（典型：用户手动删了安装目录，或安装器中途崩了），
@@ -766,6 +821,8 @@ export default function App() {
   const [licenseFilter, setLicenseFilter] = useState('all');
   /** 展开中的套装；null 表示没有 */
   const [bundleOpen, setBundleOpen] = useState<Bundle | null>(null);
+  /** 待确认的强力卸载目标；null 表示没有。这个动作会删目录和注册表，必须先确认 */
+  const [forceTarget, setForceTarget] = useState<LocalApp | null>(null);
   const [cleanConfig, setCleanConfig] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [appVersion, setAppVersion] = useState(APP_VERSION);
@@ -928,7 +985,7 @@ export default function App() {
               scanning={s.scanningLocal}
               onRescan={() => void s.refreshLocalApps()}
               onPurge={(name) => void s.purgeStaleApp(name)}
-              onForceUninstall={(app) => void s.forceUninstallApp(app)}
+              onForceUninstall={(app) => setForceTarget(app)}
               onCleanCache={() => void s.cleanCache()}
               cacheBusy={s.cacheBusy}
               onOpenTool={(id) => { const t = TOOLS.find((x) => x.id === id); if (t) openDetail(t); }}
@@ -1065,6 +1122,15 @@ export default function App() {
           message={s.stalePrompt.message}
           onPurge={() => void s.purgeStaleApp(s.stalePrompt!.name)}
           onClose={s.dismissStalePrompt}
+          lang={lang}
+        />
+      )}
+      {forceTarget && (
+        <ForceUninstallModal
+          app={forceTarget}
+          busy={s.forceBusy === forceTarget.name}
+          onConfirm={() => { void s.forceUninstallApp(forceTarget); setForceTarget(null); }}
+          onClose={() => setForceTarget(null)}
           lang={lang}
         />
       )}

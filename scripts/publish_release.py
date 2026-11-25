@@ -49,7 +49,13 @@ def main():
         if ctype:
             headers["Content-Type"] = ctype
         req = urllib.request.Request(url, data=raw if raw else (json.dumps(data).encode() if data else None), headers=headers, method=method)
-        return json.load(urllib.request.urlopen(req, timeout=180))
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            body = resp.read()
+        # DELETE 返回 204 No Content，body 是空的；直接 json.load 会抛
+        # JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+        if not body:
+            return {}
+        return json.loads(body)
 
     tag = f"v{args.version}"
     # 已存在同名 Release 时先删掉（便于重发）

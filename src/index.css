@@ -2146,3 +2146,35 @@ body::before {
   color: var(--ink-3);
   line-height: 1.5;
 }
+/* 强力卸载确认：把五步操作摆出来，用户点确认前知道要动什么 */
+.force-steps {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.force-steps li {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 12px;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+.force-steps li b {
+  flex: none;
+  width: 17px;
+  height: 17px;
+  margin-top: 1px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--glass-4);
+  border: 1px solid var(--edge-soft);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--ink-3);
+}
