@@ -82,6 +82,8 @@ function Sidebar({
         <div className="brand-mark">🛡️</div>
         <div><div className="brand-name">ToolArk</div><div className="brand-sub">工具方舟</div></div>
       </div>
+      {/* 导航区独立滚动，底部「设置 / 检查更新 / 版本号」固定不动 */}
+      <div className="sidebar-scroll">
       <div className={`mode-badge${isTauri() ? ' real' : ''}`} id="mode-badge">
         <span className="d" /><span>{isTauri() ? T('desktopMode') : T('previewMode')}</span>
       </div>
@@ -113,15 +115,19 @@ function Sidebar({
       {extraNav('compare', '⚖️', T('compare'))}
       {extraNav('config', '💾', T('configBackup'))}
       {extraNav('submit', '🤝', T('submit'))}
-      <div className="nav-label">{lang === 'zh' ? '应用' : 'App'}</div>
-      {extraNav('settings', '⚙️', lang === 'zh' ? '设置' : 'Settings')}
-      <button className="check-update-btn" onClick={() => updater.checkUpdate()} disabled={updater.state.phase === 'checking'}>
-        <span>⬆️</span>{updater.state.phase === 'checking' ? T('checking') : (lang === 'zh' ? '检查应用更新' : 'Check app update')}
-      </button>
+      </div>
       <div className="sidebar-foot">
-        <b>{total}</b> {T('tools')} · {T('installedCount')} <b>{installed.size}</b><br />
-        100% Open Source · No Ads<br />
-        <span className="version">v{appVersion || APP_VERSION}</span>
+        <button className={`nav-item ${extra === 'settings' ? 'active' : ''}`} onClick={() => { setExtra('settings'); onClose?.(); }}>
+          <span className="ic">⚙️</span><span>{lang === 'zh' ? '设置' : 'Settings'}</span>
+        </button>
+        <button className="check-update-btn" onClick={() => updater.checkUpdate()} disabled={updater.state.phase === 'checking'}>
+          <span>⬆️</span>{updater.state.phase === 'checking' ? T('checking') : (lang === 'zh' ? '检查应用更新' : 'Check app update')}
+        </button>
+        <div className="foot-meta">
+          <b>{total}</b> {T('tools')} · {T('installedCount')} <b>{installed.size}</b><br />
+          100% Open Source · No Ads<br />
+          <span className="version">v{appVersion || APP_VERSION}</span>
+        </div>
       </div>
     </aside>
   );
