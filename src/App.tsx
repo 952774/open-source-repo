@@ -71,6 +71,11 @@ function Sidebar({
       <span className="ic">{ic}</span><span>{label}</span>
     </button>
   );
+  const [catsOpen, setCatsOpen] = useState(false);
+  // 11 个分类平铺会把「工具 / 应用」两组挤到可视区外，900px 高的窗口里
+  // 用户根本看不到设置入口。默认只显示前 6 个，其余折叠起来。
+  const visibleCats = catsOpen ? CATEGORIES : CATEGORIES.slice(0, 6);
+  const hiddenCount = CATEGORIES.length - visibleCats.length;
   return (
     <aside className={`sidebar${open ? " open" : ""}`}>
       <div className="brand">
@@ -96,7 +101,13 @@ function Sidebar({
       {nav('favorites', '❤️', lang === 'zh' ? '我的收藏' : 'Favorites', favorites.size)}
       {extraNav('local', '💻', lang === 'zh' ? '本机软件' : 'On This PC')}
       <div className="nav-label">{T('categories')}</div>
-      {CATEGORIES.map((c) => nav(c.id, c.icon, lang === 'zh' ? c.name : (CATEGORY_EN[c.id] ?? c.name)))}
+      {visibleCats.map((c) => nav(c.id, c.icon, lang === 'zh' ? c.name : (CATEGORY_EN[c.id] ?? c.name)))}
+      {(hiddenCount > 0 || catsOpen) && (
+        <button className="nav-more" onClick={() => setCatsOpen((v) => !v)}>
+          <span className="ic">{catsOpen ? '⌃' : '⌄'}</span>
+          <span>{catsOpen ? (lang === 'zh' ? '收起分类' : 'Show less') : (lang === 'zh' ? `更多分类（${hiddenCount}）` : `More (${hiddenCount})`)}</span>
+        </button>
+      )}
       <div className="nav-label">{lang === 'zh' ? '工具' : 'Tools'}</div>
       {extraNav('scene', '🧭', T('sceneGuide'))}
       {extraNav('compare', '⚖️', T('compare'))}
@@ -780,7 +791,21 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [s.selected, s.install.phase, s.setSelected, s.closeInstall]);
 
+  // toast 自动消失：之前只能手点，批量卸载/安装的提示会一直压在右下角
+  useEffect(() => {
+    if (!s.toast) return;
+    // 报错类信息留久一点，成功类 4 秒足够
+    const isErr = /失败|错误|无法|取消|fail|error/i.test(s.toast);
+    const timer = setTimeout(() => s.closeToast(), isErr ? 8000 : 4000);
+    return () => clearTimeout(timer);
+  }, [s.toast, s.closeToast]);
+
   const licenses = Array.from(new Set(s.filtered.map((t) => t.license.split(/[\s/]/)[0]))).sort();
+  // 切换视图/搜索时重置许可证筛选：否则从「全部」筛了 MIT 再切到某个分类，
+  // 该分类下没有 MIT 工具就会得到一个空列表，而筛选条上还亮着 MIT，用户看不出原因。
+  useEffect(() => {
+    setLicenseFilter('all');
+  }, [s.view, s.query]);
   const visible = licenseFilter === 'all' ? s.filtered : s.filtered.filter((t) => t.license.startsWith(licenseFilter));
   const showBundles = s.view === 'featured' || s.view === 'all';
   const upgradableIds = new Set(s.upgradable.map((u) => u.wingetId.toLowerCase()));
@@ -792,9 +817,10 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar view={s.view} setView={s.setView} installed={s.installed} favorites={s.favorites} total={s.total} updater={updater}
+      <Sidebar view={s.view} setView={(v) => { s.setSelected(null); s.setView(v); }}
+        installed={s.installed} favorites={s.favorites} total={s.total} updater={updater}
         lang={lang} open={sidebarOpen} onClose={() => setSidebarOpen(false)} appVersion={appVersion}
-        extra={extra} setExtra={setExtra} T={T} />
+        extra={extra} setExtra={(v) => { s.setSelected(null); setExtra(v); }} T={T} />
 
       <main className="main">
         <header className="topbar">

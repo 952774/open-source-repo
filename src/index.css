@@ -262,6 +262,15 @@ a { color: var(--brand); text-decoration: none; }
   padding: 0 5px; border-radius: 99px; background: var(--glass-4);
 }
 .nav-item.active .cnt { color: var(--brand); background: color-mix(in srgb, var(--brand) 14%, transparent); }
+/* 「更多分类」折叠按钮：与 .nav-item 同构，但用更淡的颜色表达它是次级操作 */
+.nav-more {
+  width: 100%; display: flex; align-items: center; gap: 9px;
+  padding: 7px 10px; border-radius: 8px; text-align: left;
+  color: var(--ink-3); font-size: 12.5px; font-weight: 450;
+  transition: background .14s var(--ease), color .14s var(--ease);
+}
+.nav-more:hover { background: var(--glass-4); color: var(--ink-2); }
+.nav-more .ic { font-size: 13px; width: 18px; text-align: center; flex: none; }
 
 .check-update-btn {
   width: 100%; display: flex; align-items: center; justify-content: center; gap: 7px;
@@ -560,31 +569,13 @@ a { color: var(--brand); text-decoration: none; }
 .meta-row .v a { color: var(--brand); font-family: inherit; }
 .drawer-actions { display: flex; gap: 9px; margin-top: 24px; }
 
-/* ============================================================ Buttons */
-.btn-primary {
-  flex: 1; padding: 12px; border-radius: var(--r-sm);
-  font-size: 13px; font-weight: 600; color: #fff;
-  background: linear-gradient(140deg, var(--brand), var(--brand-2));
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.28), 0 8px 22px -6px rgba(91,91,214,.6);
-  transition: transform .22s var(--spring), filter .2s;
-}
-.btn-primary:hover { transform: translateY(-1px); filter: brightness(1.06); }
-.btn-ghost {
-  padding: 12px 18px; border-radius: var(--r-sm);
-  font-size: 13px; font-weight: 500; color: var(--ink-2);
-  background: var(--glass-4); border: 1px solid var(--edge-soft);
-  transition: .2s;
-}
-.btn-ghost:hover { background: var(--glass-3); color: var(--ink); }
-.btn-danger {
-  flex: 1; padding: 12px; border-radius: var(--r-sm);
-  font-size: 13px; font-weight: 600; color: var(--red);
-  background: color-mix(in srgb, var(--red) 9%, transparent);
-  border: 1px solid color-mix(in srgb, var(--red) 20%, transparent);
-  transition: .2s;
-}
-.btn-danger:hover { background: color-mix(in srgb, var(--red) 16%, transparent); }
-.btn-danger:disabled, .btn-ghost:disabled { opacity: .5; cursor: wait; }
+/* ============================================================ Buttons
+ *
+ * v1.2.0 起按钮的尺寸/圆角/字重全部由文件末尾的「统一按钮体系」token 节决定。
+ * 这里原本的 .btn-primary / .btn-ghost / .btn-danger 各自写死了 padding:12px
+ * 与 flex:1，既和后一节冲突，又让设置页、网络引导卡里的按钮被拉成整行宽。
+ * 已删除，只保留下方 .drawer-actions 这类容器布局。
+ */
 
 /* ============================================================ Modal */
 .modal {
@@ -661,8 +652,7 @@ a { color: var(--brand); text-decoration: none; }
 .notice.ok { background: rgba(10,143,106,.07); border-color: rgba(10,143,106,.18); color: var(--green); }
 .notice.err { background: color-mix(in srgb, var(--red) 8%, transparent); border-color: color-mix(in srgb, var(--red) 20%, transparent); color: var(--red); }
 
-.modal-actions { display: flex; gap: 9px; margin-top: 20px; }
-.modal-actions button { flex: 1; }
+/* .modal-actions 在文件末尾统一定义（两列等宽），此处不再重复 */
 
 .progress {
   height: 5px; border-radius: 99px; overflow: hidden;
@@ -1465,16 +1455,7 @@ body::before {
   border-color: rgba(255,255,255,.10);
 }
 
-/* 按钮：收敛阴影强度，统一圆角 */
-.btn-get {
-  background: linear-gradient(160deg, #5b52e8, #6d5ce7);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.24), 0 4px 14px -5px rgba(79,70,229,.5);
-}
-.btn-primary {
-  background: linear-gradient(160deg, #5b52e8, #6d5ce7);
-  box-shadow: inset 0 1px 0 rgba(255,255,255,.22), 0 6px 18px -6px rgba(79,70,229,.5);
-  border-radius: 13px;
-}
+/* 按钮：v1.2.0 起统一由文件末尾 token 节定义，这里不再重复声明 */
 
 /* 标题：更紧的字距，更稳的字重 */
 .section-head h2 { letter-spacing: -.028em; font-weight: 650; }
@@ -1698,7 +1679,8 @@ body::before {
   border-color: color-mix(in srgb, var(--red) 24%, transparent);
 }
 
-.btn-get { border-radius: var(--btn-r-pill); min-width: 108px; }
+/* .btn-get 的形状与尺寸已在上面「App Store 风格胶囊按钮」与末尾 token 节定义，
+   这里原先的 min-width:108px 会让「获取」比旁边的「打开」宽一截，已删除 */
 .btn-pick { min-height: var(--btn-h); padding: 0 14px; border-radius: var(--btn-r); }
 
 /* 弹窗底部按钮：两列等宽，高度一定一致 */
