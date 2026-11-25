@@ -301,7 +301,7 @@ type RankTab = 'downloads' | 'stars' | 'fresh' | 'featured';
 export function RankView({ lang, onOpen }: { lang: Lang; onOpen: (t: Tool) => void }) {
   const [tab, setTab] = useState<RankTab>('downloads');
   const [cat, setCat] = useState<string>('all');
-  const { fetchedAt, liveCount } = useDownloadsLive();
+  const { version, fetchedAt, liveCount } = useDownloadsLive();
 
   const list = useMemo(() => {
     let base = TOOLS;
@@ -317,7 +317,7 @@ export function RankView({ lang, onOpen }: { lang: Lang; onOpen: (t: Tool) => vo
         .slice(0, 30);
     }
     return base.filter((t) => t.featured);
-  }, [tab, cat, liveCount]);
+  }, [tab, cat, version]);
 
   const tabs: Array<[RankTab, string, string]> = [
     ['downloads', '📥', zh(lang) ? '下载榜' : 'Downloads'],
