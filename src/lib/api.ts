@@ -351,6 +351,10 @@ export interface AppTarget {
   displayName: string | null;
   /** 注册表 InstallLocation 回读值，用来核实安装位置是否被安装器采纳 */
   installLocation?: string | null;
+  /** AppX/MSIX 包的启动 URI：shell:AppsFolder\<PackageFamilyName>!<AppId> */
+  launchUri?: string | null;
+  /** AppX 包的 PackageFamilyName */
+  packageFamily?: string | null;
   source: string | null;
 }
 

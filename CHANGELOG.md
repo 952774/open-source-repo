@@ -2,6 +2,47 @@
 
 本项目遵循语义化版本。清单（tools.ts）的增删不计入版本号，随发布一起更新。
 
+## v1.3.1 — 2026-11-25
+
+这一版只修三处「看起来没反应」的问题，其中两处是上一版埋的。
+
+### 修：安装包体积一直显示「未知」
+
+详情页的「安装包体积」从来都是「未知」。原因不在取大小的逻辑，而在取不到解析输入：
+ToolArk 用 `CREATE_NO_WINDOW` 起 PowerShell，没有控制台时 PowerShell 会把
+`[Console]::OutputEncoding` 退成 **gb2312**、`$OutputEncoding` 退成 **us-ascii**。
+winget 吐的是 UTF-8 字节，走管道时被按 GBK 解码，「安装程序 URL」就成了
+`瀹夎绋嬪簭 URL`，中文正则永远匹配不上。
+
+现在不再让 PowerShell 接管 winget 的 stdout：重定向到临时文件，再用
+`[IO.File]::ReadAllText($tmp, UTF8)` 读原始字节，正则改成 `(?m)^\s*(?:安装程序|Installer)\s*(?:URL|Url)\s*[:：]\s*(\S+)`
+（锚定行首，免得把「发布服务器 URL」当成安装器地址）。实测：Git 66.9 MB、
+OpenShot 248 MB、7-Zip 2.0 MB、Windows Terminal 23.8 MB、uv 15.6 MB，全部命中。
+
+### 修：MSIX 应用包既打不开也卸不掉
+
+TranslucentTB 装完点「打开」提示定位失败，点清理又提示「没找到残留注册表条目」。
+它 `winget show` 的安装程序类型是 `msix`——装进 `C:\Program Files\WindowsApps`，
+既不写 ARP 三根注册表，也不在 App Paths 里，原来的三级定位（注册表 → InstallLocation
+递归 → App Paths）全都够不着，于是被当成"注册表残留"，而残留清理又只认注册表，
+形成死循环。
+
+新增第四条定位路径 `4) AppX / MSIX 兜底`：`Get-AppxPackage` 按包名匹配，从
+`AppxManifest.xml` 里取 `<Application Id="...">`，拼成
+`shell:AppsFolder\<PackageFamilyName>!<AppId>` 交给 `explorer.exe` 启动。
+卸载侧新增 `appx_uninstall.ps1`（`Remove-AppxPackage`），`purge_stale` 与
+`uninstall_tool` 在 winget 通道失败后都会先试它；`force_uninstall.ps1` 也加了
+「2b. MSIX / AppX 应用包」一步。缓存版本提到 v4，让 v3 里那些 `exe=null` 的
+旧条目一次作废。
+
+### 修：没装的软件显示成「夸克」
+
+排查上面那条时发现：查 TranslucentTB 返回的 displayName 是「夸克」。
+根因是 PowerShell 的作用域——`Where-Object` 脚本块里赋值不会创建局部变量，
+而是直接写到当前作用域。退化匹配块里用 `$dn` 当临时变量，把外层 `$dn` 污染了，
+最后留下的是 ARP 遍历的最后一轮值。临时变量改名 `$dnNorm`，并在块后显式
+`$dn = $null`。
+
 ## v1.3.0 — 2026-11-25
 
 这一版是安装流程的整体重做：安装不再占着模态框，进度搬到常驻底栏，可以暂停、继续、取消，

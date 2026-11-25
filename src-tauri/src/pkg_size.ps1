@@ -27,20 +27,37 @@ foreach ($c in @(
 }
 if (-not $winget) { $winget = 'winget.exe' }
 
-$show = & $winget show --id $pkgId --exact --source winget --disable-interactivity 2>$null
-if (-not $show) {
+# 关键：不能让 PowerShell 直接接管 winget 的 stdout。
+#
+# ToolArk 用 CREATE_NO_WINDOW 起 PowerShell，此时子进程没有控制台，
+# [Console]::OutputEncoding 是 gb2312、$OutputEncoding 是 us-ascii，
+# 而 winget 吐的是 UTF-8 字节。走管道的话 PowerShell 会按 GBK 解码，
+# 「安装程序 URL」被解成「瀹夎绋嬪簭 URL」，下面的中文正则永远匹配不上，
+# 所有包都返回 no-url（这正是 1.3.0 里详情页体积一直显示「未知」的原因）。
+#
+# 绕开办法：重定向到文件，再由我们按 UTF-8 读原始字节。
+$tmp = Join-Path $env:TEMP ("toolark-show-" + [guid]::NewGuid().ToString('N') + ".txt")
+& cmd /c "`"$winget`" show --id $pkgId --exact --source winget --disable-interactivity > `"$tmp`" 2>&1" | Out-Null
+
+if (-not (Test-Path -LiteralPath $tmp)) {
   $result.note = 'show-failed'
   Write-Output ($result | ConvertTo-Json -Compress)
   exit 0
 }
 
-# 中英文两套标签都认：安装程序 URL / Installer Url
+$raw = [IO.File]::ReadAllText($tmp, [Text.Encoding]::UTF8)
+Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+if ([string]::IsNullOrWhiteSpace($raw)) {
+  $result.note = 'show-failed'
+  Write-Output ($result | ConvertTo-Json -Compress)
+  exit 0
+}
+
+# 中英文两套标签都认：安装程序 URL / Installer Url。
+# 用 (?m)^ 锚定行首，避免把「发布服务器 URL」这类同后缀字段错认成安装器地址。
 $url = ''
-foreach ($line in $show) {
-  if ($line -match '(安装程序\s*URL|Installer\s*Url)\s*[:：]\s*(\S+)') {
-    $url = $Matches[2].Trim()
-    break
-  }
+if ($raw -match '(?m)^\s*(?:安装程序|Installer)\s*(?:URL|Url)\s*[:：]\s*(\S+)\s*$') {
+  $url = $Matches[1].Trim()
 }
 if (-not $url) {
   $result.note = 'no-url'

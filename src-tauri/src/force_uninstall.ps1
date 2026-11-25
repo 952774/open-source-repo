@@ -94,6 +94,39 @@ if ($uninstallCmd) {
   Add-Step '调用卸载器' $false '没有可用的卸载命令'
 }
 
+# ── 2b. MSIX / AppX 应用包 ─────────────────────────────────────────
+# 有一类软件根本不在 ARP 注册表里：winget 的 installer type 是 msix 的包
+# （TranslucentTB、Store 版 Windows Terminal 等）由 AppX 部署服务托管，
+# 上面三步对它全部空转，用户会看到"五步都 done=false"的诡异结果。
+# 这里单独用 Remove-AppxPackage 处理。
+$appxRemoved = 0
+if ($name -and -not $dry) {
+  $appx = @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {
+      $n = [string]$_.Name
+      $n -and ($n -ilike "*$name*" -or $name -ilike "*$n*")
+    })
+  if ($appx.Count -eq 0) {
+    $normA = ($name -replace '[^A-Za-z0-9]', '').ToLower()
+    if ($normA) {
+      $appx = @(Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object {
+          $n = ([string]$_.Name -replace '[^A-Za-z0-9]', '').ToLower()
+          $n -and ($n -eq $normA -or $n.Contains($normA) -or $normA.Contains($n))
+        })
+    }
+  }
+  foreach ($p in $appx) {
+    try {
+      Remove-AppxPackage -Package ([string]$p.PackageFullName) -ErrorAction Stop
+      $appxRemoved++
+    } catch {
+      $result.errors += ("移除应用包 {0} 失败: {1}" -f $p.PackageFullName, $_.Exception.Message)
+    }
+  }
+  if ($appx.Count -gt 0) {
+    Add-Step '移除 MSIX 应用包' ($appxRemoved -gt 0) ("{0}/{1}" -f $appxRemoved, $appx.Count)
+  }
+}
+
 # ── 3. 清理 ARP 注册表键 ──────────────────────────────────────────
 # 三根都要看：64 位、32 位（WOW6432Node）、当前用户。
 $arpRoots = @(
@@ -178,6 +211,6 @@ if ($name) {
 }
 Add-Step '清理快捷方式' ($lnks.Count -gt 0) (($lnks | ForEach-Object { Split-Path -Leaf $_ }) -join ', ')
 
-$result.removed = $arpRemoved.Count + $lnks.Count
-$result.ok = ($result.errors.Count -eq 0 -or $arpRemoved.Count + $lnks.Count + $(if ($dirRemoved) { 1 } else { 0 }) -gt 0)
+$result.removed = $arpRemoved.Count + $lnks.Count + $appxRemoved
+$result.ok = ($result.errors.Count -eq 0 -or $arpRemoved.Count + $lnks.Count + $appxRemoved + $(if ($dirRemoved) { 1 } else { 0 }) -gt 0)
 Write-Output ($result | ConvertTo-Json -Compress -Depth 5)

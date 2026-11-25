@@ -512,6 +512,8 @@ const PURGE_STALE_PS1: &str = include_str!("purge_stale.ps1");
 const PROC_CTL_PS1: &str = include_str!("proc_ctl.ps1");
 const PKG_SIZE_PS1: &str = include_str!("pkg_size.ps1");
 const FORCE_UNINSTALL_PS1: &str = include_str!("force_uninstall.ps1");
+/// AppX/MSIX 包的卸载：走 Remove-AppxPackage，ARP 里查不到它们
+const APPX_UNINSTALL_PS1: &str = include_str!("appx_uninstall.ps1");
 
 /// 把脚本正文编码成落盘字节：UTF-8 BOM + 正文。
 ///
@@ -703,6 +705,16 @@ pub struct AppTarget {
     /// 命中的卸载注册表条目数
     #[serde(default)]
     matches: Option<u32>,
+    /// AppX/MSIX 包的启动 URI：shell:AppsFolder\<PackageFamilyName>!<AppId>
+    ///
+    /// 这类包（TranslucentTB、Store 版 Windows Terminal 等）不写 ARP 注册表，
+    /// 文件在 C:\Program Files\WindowsApps 受保护目录下，既没有可直接 spawn 的
+    /// exe，也没有 InstallLocation。只能用 shell:AppsFolder 交给资源管理器启动。
+    #[serde(rename = "launchUri", default)]
+    launch_uri: Option<String>,
+    /// AppX 包的 PackageFamilyName，卸载时传给 Remove-AppxPackage
+    #[serde(rename = "packageFamily", default)]
+    package_family: Option<String>,
     source: Option<String>,
 }
 
@@ -714,7 +726,11 @@ pub struct AppTarget {
 /// v3：AppTarget 新增 installLocation。v2 写下的条目没有这个字段，
 /// 反序列化后是 None，而命中缓存的判定只要求 exe 存在，
 /// 于是升级到 1.1.x 的用户做安装位置核对时永远拿不到注册表回读值。
-const CACHE_VERSION: u32 = 3;
+///
+/// v4：AppTarget 新增 launchUri / packageFamily。v3 缓存里 AppX 类应用的条目
+/// 只有 exe=None，命中判定会直接判成"没定位到"并落到残留分支；
+/// 升版本号让旧条目作废，MSIX 包才能走到 shell:AppsFolder 启动。
+const CACHE_VERSION: u32 = 4;
 
 fn app_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir(app)?.join(format!("app-paths.v{CACHE_VERSION}.json")))
@@ -747,6 +763,11 @@ async fn lookup_app(app: &AppHandle, name: &str) -> Option<AppTarget> {
                 return Some(hit.clone());
             }
         }
+        // AppX 包没有 exe，缓存命中判定不能只看 exe：
+        // 有 launchUri 就说明上次已经确认过这个包还装着。
+        if hit.exe.is_none() && hit.launch_uri.is_some() {
+            return Some(hit.clone());
+        }
     }
     let out = run_ps1(
         app,
@@ -758,7 +779,7 @@ async fn lookup_app(app: &AppHandle, name: &str) -> Option<AppTarget> {
     .ok()?;
     let line = out.lines().find(|l| l.trim_start().starts_with('{'))?;
     let parsed: AppTarget = serde_json::from_str(line.trim()).ok()?;
-    if parsed.exe.is_none() {
+    if parsed.exe.is_none() && parsed.launch_uri.is_none() {
         log_line(app, "lookup", &format!("未定位到应用: {name}"));
         return None;
     }
@@ -897,11 +918,61 @@ async fn purge_stale_entries(
     Ok(r)
 }
 
+/// 用 Remove-AppxPackage 移除 MSIX 应用包，返回移除的包数。
+///
+/// MSIX 包不写 ARP 注册表，winget uninstall 走安装器通道时必然报
+/// 0x800401f5 Application not found；只有 AppX 部署服务能卸它们。
+/// 找不到包返回 Ok(0)，不当作错误——调用方会退回注册表残留清理。
+async fn remove_appx_package(
+    app: &AppHandle,
+    name: &str,
+    dry_run: bool,
+) -> Result<usize, String> {
+    let out = run_ps1(
+        app,
+        "appx_uninstall.ps1",
+        APPX_UNINSTALL_PS1,
+        &[
+            ("TOOLARK_NAME", name.to_string()),
+            ("TOOLARK_DRY", if dry_run { "1" } else { "0" }.to_string()),
+        ],
+    )
+    .await?;
+    let Some(v) = last_json(&out) else {
+        return Ok(0);
+    };
+    let removed = v.get("removed").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    if removed > 0 || dry_run {
+        log_line(
+            app,
+            "appx",
+            &format!(
+                "{name}: dry_run={dry_run} removed={removed} names={}",
+                v.get("names")
+                    .and_then(|x| x.as_array())
+                    .map(|a| a
+                        .iter()
+                        .filter_map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","))
+                    .unwrap_or_default()
+            ),
+        );
+    }
+    Ok(removed)
+}
+
 /// 清理安装残留（前端显式调用，用于「打开失败 → 一键清理」）
 #[tauri::command]
 async fn purge_stale(app: AppHandle, name: String) -> Result<String, String> {
     if name.trim().is_empty() || name.len() > 200 {
         return Err("无效的软件名".into());
+    }
+    // MSIX 包先走 AppX 通道：它们在 ARP 里没有条目，注册表清理必然空手而归，
+    // 用户会收到"没找到残留注册表条目"这种看起来像 bug 的提示。
+    let appx = remove_appx_package(&app, &name, false).await.unwrap_or(0);
+    if appx > 0 {
+        return Ok(format!("已移除 {appx} 个 MSIX 应用包（{name}）"));
     }
     let r = purge_stale_entries(&app, &name, false).await?;
     if r.removed == 0 {
@@ -1582,6 +1653,25 @@ async fn uninstall_tool(
         // winget 卸载失败最常见的原因是安装器本身已丢失（0x800401f5 Application not found），
         // 此时 winget 仍认为包装着，但注册表里的卸载器指向一个不存在的文件。
         // 这种情况下自动降级为「清理注册表残留」，否则用户永远卸不掉这个幽灵条目。
+        //
+        // 但在那之前先试 AppX：installer type 为 msix 的包（TranslucentTB 等）
+        // 在 ARP 里压根没有条目，purge_stale 一定返回 removed=0，
+        // 用户会看到"安装器已丢失但没找到可移除的注册表条目"这种死路提示。
+        let appx_removed = remove_appx_package(&app, &name, false).await.unwrap_or(0);
+        if appx_removed > 0 {
+            let mut ids = read_records(&app);
+            ids.retain(|x| x != &tool_id);
+            let _ = write_records(&app, &ids);
+            log_line(
+                &app,
+                "uninstall",
+                &format!("{name} 是 MSIX 应用包，已用 Remove-AppxPackage 移除 {appx_removed} 个包"),
+            );
+            return Ok(format!(
+                "{name} 是 MSIX 应用包，winget 的卸载通道走不通，已改用系统应用包接口移除 {appx_removed} 个包"
+            ));
+        }
+
         let looks_stale = log.contains("0x800401f5")
             || log.contains("Application not found")
             || log.contains("应用程序未找到")
@@ -1844,7 +1934,12 @@ async fn open_tool(
     };
 
     let Some(exe) = target.exe.clone() else {
-        // 注册表有条目但没有可执行文件：这是 ARP 残留
+        // 没有 exe 有两种完全不同的情况，必须分开处理：
+        //   a) AppX/MSIX 包 —— 本来就没有可 spawn 的 exe，用 shell:AppsFolder 启动
+        //   b) 注册表残留 —— 条目还在、文件没了，引导用户清理
+        if let Some(uri) = target.launch_uri.clone() {
+            return Ok(launch_appx(&app, &name, &uri));
+        }
         let loc = target.install_location.clone().unwrap_or_default();
         let detail = if loc.is_empty() {
             "注册表里还留着它的卸载条目，但程序文件已经不在了。".to_string()
@@ -1905,6 +2000,62 @@ async fn open_tool(
             stale: false,
             stale_name: None,
         }),
+    }
+}
+
+/// 启动 AppX/MSIX 包。
+///
+/// 这类包的可执行文件在 C:\Program Files\WindowsApps 里（ACL 只给 AppX 部署服务），
+/// 直接 spawn 会被拒绝访问；正确入口是 shell:AppsFolder\<PackageFamilyName>!<AppId>，
+/// 由资源管理器转交给 AppX 激活服务。这里统一走 explorer.exe，并保留
+/// `explorer.exe shell:...` 失败时退回 `cmd /c start` 的兜底。
+fn launch_appx(app: &AppHandle, name: &str, uri: &str) -> OpenResult {
+    log_line(app, "open", &format!("启动 AppX {name} → {uri}"));
+    #[cfg(windows)]
+    {
+        let attempts: [(&str, Vec<String>); 2] = [
+            ("explorer.exe", vec![uri.to_string()]),
+            (
+                "cmd.exe",
+                vec!["/c".into(), "start".into(), String::new(), uri.to_string()],
+            ),
+        ];
+        let mut last_err = String::new();
+        for (bin, args) in attempts {
+            let mut cmd = std::process::Command::new(bin);
+            cmd.args(&args);
+            cmd.creation_flags(0x0800_0000);
+            match cmd.spawn() {
+                Ok(_) => {
+                    return OpenResult {
+                        ok: true,
+                        message: format!("已启动 {name}"),
+                        exe: Some(uri.to_string()),
+                        stale: false,
+                        stale_name: None,
+                    }
+                }
+                Err(e) => last_err = format!("{bin}: {e}"),
+            }
+        }
+        return OpenResult {
+            ok: false,
+            message: format!("启动 {name} 失败：{last_err}"),
+            exe: Some(uri.to_string()),
+            stale: false,
+            stale_name: None,
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = uri;
+        OpenResult {
+            ok: false,
+            message: format!("{name} 是 Windows 应用包，当前平台无法启动"),
+            exe: None,
+            stale: false,
+            stale_name: None,
+        }
     }
 }
 
@@ -2469,6 +2620,7 @@ Microsoft Visual C++ 2015 UWP Desktop Runtime Package        Microsoft.VCLibs.De
             ("proc_ctl.ps1", PROC_CTL_PS1),
             ("pkg_size.ps1", PKG_SIZE_PS1),
             ("force_uninstall.ps1", FORCE_UNINSTALL_PS1),
+            ("appx_uninstall.ps1", APPX_UNINSTALL_PS1),
         ];
         for (name, body) in all {
             assert!(
