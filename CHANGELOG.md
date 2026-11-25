@@ -2,6 +2,30 @@
 
 本项目遵循语义化版本。清单（tools.ts）的增删不计入版本号，随发布一起更新。
 
+## v1.0.2 — 2026-11-25
+
+修 v1.0.1 装到真机上才暴露的三个运行期 bug。这三个都是「单元测试全绿、真实环境才崩」的类型，
+所以这一版补的测试都直接喂真实输出。
+
+- **已安装状态一直是空的**。`winget list` 的真实输出只有「名称 / ID / 版本 / 可用」四列，
+  没有 Source 列，而解析器强制要求行尾是 `winget`/`msstore` → 每一行都被丢弃，日志里只有
+  `[scan] winget list 解析出 0 个包`。改为「从右往左找包 ID」并兼容带 Source 列的旧格式，
+  实测能解析出 70 个真实包。新增两条回归测试，一条喂真实四列中文输出，一条守「名称里带点
+  不能被误认成 ID」（`7-Zip 24.09` 对 `7zip.7zip`）。
+- **程序定位会选错 exe**。原来按体积挑主程序，`Git` 被定位到 `git-lfs.exe`（比 `git.exe` 大）。
+  改为「文件名与应用名/显示名/安装目录名归一化比对」打分，明确的附属程序名（`lfs`、`daemon`、
+  `service`、`cli`、`crashpad`、`updater`）扣分；`DisplayIcon` 不再盲信（Git 的 DisplayIcon
+  指向的就是 `git-lfs.exe`）。同时加两阶段深度搜索，浅搜（Depth 2）没命中文件名再深搜
+  （Depth 4）——Epic Games Launcher 的主 exe 埋在 `Launcher\Portal\Binaries\Win64` 下。
+- **PS1 助手脚本在真机解析失败**。`materialize_script` 写的是无 BOM 的 UTF-8，
+  Windows PowerShell 5.1 在无 BOM 时按系统 ANSI（简中为 GBK）解码，脚本里的中文注释被拆成
+  非法字节 → 花括号配对失衡，报 `表达式或语句中包含意外的标记"}"`，桌面快捷方式与「打开」
+  按钮全部失效。改为落盘时写 UTF-8 BOM。新增 `script_bytes_starts_with_utf8_bom` 与
+  `embedded_scripts_contain_cjk` 两条测试守住这个前提。
+- 应用路径缓存文件名带版本号（`app-paths.v2.json`）：上一版把 Git 缓存成了 `git-lfs.exe`，
+  不清缓存的话升级后仍然打开错程序。
+- `InstalledPackage` 派生 `Debug`，测试断言失败时能直接打印实际解析结果。
+
 ## v1.0.1 — 2026-11-25
 
 补齐 v1.0.0 遗留的预览图缺口。

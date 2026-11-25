@@ -431,12 +431,24 @@ fn install_args(winget_id: &str, location: Option<&str>) -> Vec<String> {
 const APP_LOOKUP_PS1: &str = include_str!("app_lookup.ps1");
 const MAKE_SHORTCUT_PS1: &str = include_str!("make_shortcut.ps1");
 
+/// 把脚本正文编码成落盘字节：UTF-8 BOM + 正文。
+///
+/// 必须带 BOM：Windows PowerShell 5.1 在无 BOM 时按系统 ANSI（简中为 GBK）解码脚本，
+/// 中文注释会被拆成非法字节，导致花括号配对失衡，报
+/// `表达式或语句中包含意外的标记"}"`。
+fn script_bytes(body: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(body.len() + 3);
+    bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    bytes.extend_from_slice(body.as_bytes());
+    bytes
+}
+
 /// 把内嵌脚本写到数据目录，返回路径（每次覆盖，保证与程序同版本）
 fn materialize_script(app: &AppHandle, name: &str, body: &str) -> Result<PathBuf, String> {
     let dir = data_dir(app)?.join("scripts");
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建脚本目录: {e}"))?;
     let path = dir.join(name);
-    std::fs::write(&path, body).map_err(|e| format!("写入脚本失败: {e}"))?;
+    std::fs::write(&path, script_bytes(body)).map_err(|e| format!("写入脚本失败: {e}"))?;
     Ok(path)
 }
 
@@ -493,8 +505,13 @@ pub struct AppTarget {
 }
 
 /// 缓存表：显示名 → 解析结果，避免每次点「打开」都跑一遍注册表扫描
+///
+/// 文件名带 CACHE_VERSION：解析策略改动后（例如修掉 Git 被定位成 git-lfs.exe），
+/// 老缓存里的错误结果必须作废，否则用户升级后仍然打开错程序。
+const CACHE_VERSION: u32 = 2;
+
 fn app_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(data_dir(app)?.join("app-paths.json"))
+    Ok(data_dir(app)?.join(format!("app-paths.v{CACHE_VERSION}.json")))
 }
 
 fn read_app_cache(app: &AppHandle) -> std::collections::HashMap<String, AppTarget> {
@@ -818,7 +835,7 @@ async fn uninstall_tool(
 // 命令：已安装校准（以 winget list 为真相）
 // ─────────────────────────────────────────────────────────────
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct InstalledPackage {
     /// winget 包 ID（如 Microsoft.VisualStudioCode）
     id: String,
@@ -830,60 +847,74 @@ pub struct InstalledPackage {
 
 /// 解析 `winget list` / `winget upgrade` 的表格行。
 ///
-/// 列宽会因中文双宽字符而错位，所以不按固定列偏移切，而按"从右往左"定位：
-/// 最后一列一定是源（winget / msstore）；倒数第二、三列是版本号（纯数字点分，
-/// 可能为空）；包 ID 是"含点且含 ASCII 字母"的那个 token。
+/// 真实输出（winget 1.29）只有「名称 / ID / 版本 / 可用」四列，**没有 Source 列**，
+/// 所以不能按"行尾必须是 winget"来判断。列宽还会因中文双宽字符错位，不能按固定
+/// 偏移切。这里按"从右往左找包 ID"定位：ID 是含 '.'、全部 ASCII、且至少有一个
+/// ASCII 字母的 token；ID 左边全是名称，右边第一段以数字开头的 token 是当前版本，
+/// 再往右若是版本号则是可用版本。
 fn parse_package_table(stdout: &str) -> Vec<InstalledPackage> {
+    fn is_pkg_id(t: &str) -> bool {
+        t.contains('.')
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '+')
+            && t.chars().any(|c| c.is_ascii_alphabetic())
+    }
+    fn is_version(t: &str) -> bool {
+        t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            && t.chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == '_')
+    }
+
     let mut out = Vec::new();
     for line in stdout.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('-') || trimmed.starts_with('\\') {
+        if trimmed.is_empty()
+            || trimmed.starts_with('-')
+            || trimmed.starts_with('\\')
+            || trimmed.starts_with('=') 
+        {
             continue;
         }
         let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-        if tokens.len() < 3 {
+        if tokens.len() < 2 {
             continue;
         }
         let first = tokens[0];
         if first == "Name" || first == "名称" || first.eq_ignore_ascii_case("name") {
             continue;
         }
-        let last = tokens[tokens.len() - 1];
-        if last != "winget" && last != "msstore" {
+
+        // 末尾若是 winget / msstore（带 Source 列的旧格式或 upgrade 输出），先剥掉
+        let mut end = tokens.len();
+        if end > 0 && (tokens[end - 1] == "winget" || tokens[end - 1] == "msstore") {
+            end -= 1;
+        }
+        if end < 2 {
             continue;
         }
 
-        // 从右往左找包 ID：含 '.'、含至少一个 ASCII 字母、不含非 ASCII
+        // 从右往左找包 ID
         let mut id_idx: Option<usize> = None;
-        for i in (0..tokens.len() - 1).rev() {
-            let t = tokens[i];
-            if t.contains('.')
-                && t.chars().all(|c| {
-                    c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '+'
-                })
-                && t.chars().any(|c| c.is_ascii_alphabetic())
-            {
+        for i in (0..end).rev() {
+            if is_pkg_id(tokens[i]) {
                 id_idx = Some(i);
                 break;
             }
         }
         let Some(idx) = id_idx else { continue };
+        if idx == 0 {
+            // 没有名称列，只可能是表头或脏数据
+            continue;
+        }
+
         let id = tokens[idx].to_string();
-        let name = if idx == 0 {
-            id.clone()
-        } else {
-            tokens[..idx].join(" ")
-        };
+        let name = tokens[..idx].join(" ");
         let version = tokens
             .get(idx + 1)
-            .filter(|t| {
-                t.chars()
-                    .next()
-                    .map(|c| c.is_ascii_digit())
-                    .unwrap_or(false)
-            })
+            .filter(|t| is_version(t))
             .map(|t| t.to_string())
             .unwrap_or_default();
+
         out.push(InstalledPackage { id, name, version });
     }
     out
@@ -1483,9 +1514,67 @@ Git                           Git.Git                         2.47.0            
         assert_eq!(items[2].id, "Git.Git");
     }
 
+    /// 真实 winget 1.29 的中文输出只有四列（名称/ID/版本/可用），没有 Source 列。
+    /// 曾经因为强制要求行尾是 winget/msstore，导致 scan_installed 解析出 0 个包。
+    #[test]
+    fn parse_package_table_reads_real_four_column_output() {
+        let out = "\
+名称                                                         ID                                     版本            可用
+---------------------------------------------------------------------------------------------------------------------------------
+Apple Mobile Device Support                                  Apple.AppleMobileDeviceSupport         19.4.0.10       
+Bandizip                                                     Bandisoft.Bandizip                     8.0 Beta 10     
+Epic Games Launcher                                          EpicGames.EpicGamesLauncher            1.3.176.0       1.3.210.0
+Git                                                          Git.Git                                2.56.1          
+Microsoft Build of OpenJDK  17.0.18+8 (x64)                  Microsoft.OpenJDK.17                   17.0.18.8       17.0.21.102
+Microsoft Visual C++ 2015 UWP Desktop Runtime Package        Microsoft.VCLibs.Desktop.14            14.0.33728.0    
+";
+        let items = parse_package_table(out);
+        assert_eq!(items.len(), 6, "四列输出应全部解析出来，实际 {:?}", items);
+        assert_eq!(items[0].id, "Apple.AppleMobileDeviceSupport");
+        assert_eq!(items[0].name, "Apple Mobile Device Support");
+        assert_eq!(items[0].version, "19.4.0.10");
+        assert_eq!(items[1].id, "Bandisoft.Bandizip");
+        // 版本号里带空格（"8.0 Beta 10"）时只取第一段数字，不报错即可
+        assert_eq!(items[1].version, "8.0");
+        assert_eq!(items[2].id, "EpicGames.EpicGamesLauncher");
+        assert_eq!(items[2].name, "Epic Games Launcher");
+        assert_eq!(items[3].id, "Git.Git");
+        assert_eq!(items[3].version, "2.56.1");
+        assert_eq!(items[4].id, "Microsoft.OpenJDK.17");
+        assert_eq!(items[4].name, "Microsoft Build of OpenJDK 17.0.18+8 (x64)");
+        assert_eq!(items[5].id, "Microsoft.VCLibs.Desktop.14");
+    }
+
+    /// 名称里带点的包（如 7-Zip 24.09）不能被误认成 ID。
+    #[test]
+    fn parse_package_table_prefers_rightmost_id() {
+        let out = "7-Zip 24.09 (x64)   7zip.7zip   24.09\n";
+        let items = parse_package_table(out);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "7zip.7zip");
+        assert_eq!(items[0].name, "7-Zip 24.09 (x64)");
+    }
+
     #[test]
     fn parse_package_table_skips_header_and_short_lines() {
         assert!(parse_package_table("Name Id Version\n---\n").is_empty());
+    }
+
+    /// PowerShell 5.1 在无 BOM 时按 GBK 解码脚本，中文注释会让脚本解析失败。
+    #[test]
+    fn script_bytes_starts_with_utf8_bom() {
+        let b = script_bytes("# 中文注释\nWrite-Output 1\n");
+        assert_eq!(&b[..3], &[0xEF, 0xBB, 0xBF], "必须以 UTF-8 BOM 开头");
+        let rest = std::str::from_utf8(&b[3..]).expect("正文应是合法 UTF-8");
+        assert!(rest.starts_with("# 中文注释"));
+        assert!(rest.contains("Write-Output 1"));
+    }
+
+    /// 内嵌的两个 PS1 脚本都必须含中文（否则 BOM 问题不会显现，测试也就失去意义）。
+    #[test]
+    fn embedded_scripts_contain_cjk() {
+        assert!(APP_LOOKUP_PS1.chars().any(|c| c as u32 > 0x2E80));
+        assert!(MAKE_SHORTCUT_PS1.chars().any(|c| c as u32 > 0x2E80));
     }
 }
 

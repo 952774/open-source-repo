@@ -43,22 +43,74 @@ if ($hits.Count -eq 0) {
 }
 
 function Resolve-ExePath($entry) {
-  # 1) DisplayIcon 最准，形如 "C:\path\app.exe,0"
+  # DisplayIcon 形如 "C:\path\app.exe,0"。
+  # 但它不一定指向主程序：Git 的 DisplayIcon 指向 git-lfs.exe，
+  # 所以先收集候选，最终由"文件名与应用名相似度"决定，而不是盲信 DisplayIcon。
+  $pool = New-Object System.Collections.ArrayList
   if ($entry.DisplayIcon) {
     $raw = [string]$entry.DisplayIcon
-    $p = ($raw -split ',')[0].Trim().Trim('"')
-    if ($p -and (Test-Path -LiteralPath $p) -and ($p -like '*.exe')) { return $p }
+    foreach ($seg in ($raw -split ',')) {
+      $p = $seg.Trim().Trim('"')
+      if ($p -and ($p -like '*.exe') -and (Test-Path -LiteralPath $p)) { [void]$pool.Add((Get-Item -LiteralPath $p)) }
+    }
   }
-  # 2) InstallLocation 下按体积挑主程序，排除卸载/更新/崩溃上报类
   if ($entry.InstallLocation) {
     $loc = ([string]$entry.InstallLocation).Trim().Trim('"')
     if ($loc -and (Test-Path -LiteralPath $loc)) {
-      $cands = @(Get-ChildItem -LiteralPath $loc -Filter *.exe -Recurse -Depth 2 -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notmatch '(?i)unins|setup|install|update|upgrade|crash|report|helper|vc_redist|elevate' } |
-        Sort-Object -Property Length -Descending)
-      if ($cands.Count -gt 0) { return $cands[0].FullName }
+      $skip = '(?i)unins|setup|install[-_]|update|upgrade|crash|report|helper|vc_redist|elevate'
+      $grab = {
+        param($depth)
+        @(Get-ChildItem -LiteralPath $loc -Filter *.exe -Recurse -Depth $depth -ErrorAction SilentlyContinue |
+          Where-Object { $_.Name -notmatch $skip })
+      }
+      # 先浅搜（快）；浅搜里没有文件名能对上应用名的，再深搜
+      # （Epic 这类主 exe 埋在 Launcher\Portal\Binaries\Win64 下，Depth 2 够不到）
+      foreach ($depth in @(2, 4)) {
+        $found = @(& $grab $depth)
+        if ($found.Count -gt 0) {
+          $before = $pool.Count
+          foreach ($f in $found) { [void]$pool.Add($f) }
+          # 浅搜阶段如果已经出现文件名命中，就不必再深搜
+          $keys0 = @($name)
+          if ($entry.DisplayName) { $keys0 += [string]$entry.DisplayName }
+          $nk = @($keys0 | ForEach-Object { ($_ -replace '[^A-Za-z0-9]', '').ToLower() } | Where-Object { $_ })
+          $hit = $false
+          foreach ($f in $found) {
+            $st = ($f.BaseName -replace '[^A-Za-z0-9]', '').ToLower()
+            foreach ($k in $nk) { if ($st -and $k -and ($st -eq $k -or $st -like "$k*" -or $k -like "$st*")) { $hit = $true } }
+          }
+          if ($hit -or $pool.Count -gt $before + 40) { break }
+        }
+      }
     }
   }
+  if ($pool.Count -eq 0) { return $null }
+
+  # 用应用名、显示名、安装目录名三路归一化后与文件名比对
+  $keys = @($name)
+  if ($entry.DisplayName) { $keys += [string]$entry.DisplayName }
+  if ($entry.InstallLocation) { $keys += (Split-Path -Leaf ([string]$entry.InstallLocation).Trim().Trim('"')) }
+  $normKeys = @($keys | ForEach-Object { ($_ -replace '[^A-Za-z0-9]', '').ToLower() } | Where-Object { $_ })
+  # 明确的主程序名（如 code / git / obsidian 这类短名）加分项
+  $best = $null
+  $bestScore = -1
+  foreach ($c in $pool) {
+    $stem = ($c.BaseName -replace '[^A-Za-z0-9]', '').ToLower()
+    if (-not $stem) { continue }
+    $score = 0
+    foreach ($k in $normKeys) {
+      if ($stem -eq $k) { if ($score -lt 100) { $score = 100 } }
+      elseif ($k -like "$stem*" -or $stem -like "$k*") { if ($score -lt 80) { $score = 80 } }
+      elseif ($k.Contains($stem) -or $stem.Contains($k)) { if ($score -lt 60) { $score = 60 } }
+    }
+    # 带附属后缀的明显不是主程序
+    if ($c.BaseName -match '(?i)lfs|daemon|service|cli|console|crashpad|updater|unins') { $score -= 40 }
+    if ($score -gt $bestScore -or ($score -eq $bestScore -and $best -and $c.Length -gt $best.Length)) {
+      $best = $c
+      $bestScore = $score
+    }
+  }
+  if ($best) { return $best.FullName }
   return $null
 }
 
