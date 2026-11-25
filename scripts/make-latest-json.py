@@ -15,7 +15,10 @@ def main():
     ap.add_argument("--repo", required=True, help="GitHub 仓库，格式：用户名/仓库名")
     ap.add_argument("--version", default=None, help="版本号（默认从 MSI 文件名推断）")
     ap.add_argument("--notes", default="Bug fixes and improvements", help="更新说明")
+    ap.add_argument("--notes-file", default=None, help="从 UTF-8 文件读取更新说明（避免中文经命令行被 GBK 破坏）")
     args = ap.parse_args()
+    if args.notes_file:
+        args.notes = Path(args.notes_file).read_text(encoding="utf-8").strip()
 
     if not BUNDLE.exists():
         raise SystemExit(f"找不到 bundle 目录：{BUNDLE}\n请先运行 npm run tauri build --bundles msi")

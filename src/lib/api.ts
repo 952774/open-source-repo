@@ -80,8 +80,21 @@ export async function installTool(
   };
 }
 
-/** 打开系统目录选择器（仅桌面版；浏览器返回 null） */
-export async function pickInstallDirectory(): Promise<string | null> {
+/**
+ * 取消正在进行的安装。
+ * Rust 侧会 taskkill /T 结束 winget 及其派生的 msiexec，然后按失败走回滚清理。
+ */
+export async function cancelInstall(toolId: string): Promise<CommandResult> {
+  if (!isTauri()) return { ok: false, message: '仅桌面版可取消' };
+  try {
+    const message = await invoke<string>('cancel_install', { toolId });
+    return { ok: true, message };
+  } catch (err) {
+    return { ok: false, message: String(err) };
+  }
+}
+
+/** 打开系统目录选择器（仅桌面版；浏览器返回 null） */export async function pickInstallDirectory(): Promise<string | null> {
   if (!isTauri()) return null;
   try {
     const { open } = await import('@tauri-apps/plugin-dialog');
@@ -226,6 +239,8 @@ export interface AppTarget {
   exe: string | null;
   workdir: string | null;
   displayName: string | null;
+  /** 注册表 InstallLocation 回读值，用来核实安装位置是否被安装器采纳 */
+  installLocation?: string | null;
   source: string | null;
 }
 

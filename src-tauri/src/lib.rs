@@ -262,6 +262,43 @@ fn winget_candidates() -> Vec<(String, Vec<String>)> {
     list
 }
 
+/// 运行中 winget 进程注册表 + 取消标记。
+///
+/// 之前安装一旦开始就没有出口：某个包卡在 GitHub Release 上反复重试时，
+/// 用户除了结束 ToolArk 进程别无办法。这里按 tool_id 记住子进程 PID，
+/// 取消时用 taskkill /T 连同安装器的孙进程一起结束。
+#[derive(Default)]
+struct RunRegistry {
+    pids: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    cancelled: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+fn register_pid(app: &AppHandle, tool_id: &str, pid: u32) {
+    if let Ok(mut m) = app.state::<RunRegistry>().pids.lock() {
+        m.insert(tool_id.to_string(), pid);
+    }
+}
+
+fn unregister_pid(app: &AppHandle, tool_id: &str) {
+    if let Ok(mut m) = app.state::<RunRegistry>().pids.lock() {
+        m.remove(tool_id);
+    }
+}
+
+fn cancel_requested(app: &AppHandle, tool_id: &str) -> bool {
+    app.state::<RunRegistry>()
+        .cancelled
+        .lock()
+        .map(|s| s.contains(tool_id))
+        .unwrap_or(false)
+}
+
+fn clear_cancel(app: &AppHandle, tool_id: &str) {
+    if let Ok(mut s) = app.state::<RunRegistry>().cancelled.lock() {
+        s.remove(tool_id);
+    }
+}
+
 /// 流式执行 winget：原生进程 + 逐行读输出 + emit 进度事件。
 /// 返回 (是否成功, 合并后的完整输出)
 async fn run_winget_stream(
@@ -328,6 +365,11 @@ async fn run_winget_stream(
             ))
         }
     };
+
+    // 登记 PID，让 cancel_install 能杀掉整棵进程树
+    if let Some(pid) = child.id() {
+        register_pid(app, tool_id, pid);
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
@@ -401,6 +443,13 @@ async fn run_winget_stream(
         .wait()
         .await
         .map_err(|e| format!("等待 winget 结束失败：{}", e))?;
+    unregister_pid(app, tool_id);
+
+    // 被取消的进程不管退出码是什么都按失败上报，让上层走回滚分支
+    if cancel_requested(app, tool_id) {
+        collected.push_str("\n[已由用户取消]\n");
+        return Ok((false, collected));
+    }
 
     Ok((status.success(), collected))
 }
@@ -501,6 +550,9 @@ pub struct AppTarget {
     workdir: Option<String>,
     #[serde(rename = "displayName")]
     display_name: Option<String>,
+    /// 注册表 InstallLocation 回读值；用来核实"用户选的目录"是否真被安装器采纳
+    #[serde(rename = "installLocation", default)]
+    install_location: Option<String>,
     source: Option<String>,
 }
 
@@ -600,6 +652,37 @@ async fn create_shortcut(app: &AppHandle, name: &str, target: &AppTarget) -> Opt
 // ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
+fn cancel_install(app: AppHandle, tool_id: String) -> Result<String, String> {
+    validate_id(&tool_id)?;
+    if let Ok(mut s) = app.state::<RunRegistry>().cancelled.lock() {
+        s.insert(tool_id.clone());
+    }
+    let pid = app
+        .state::<RunRegistry>()
+        .pids
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&tool_id).copied());
+    let Some(pid) = pid else {
+        return Ok("没有正在进行的安装".into());
+    };
+    // /T 连孙进程（msiexec、安装器本体）一起结束，只杀 winget 会留下孤儿安装进程
+    let out = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .output();
+    let msg = match out {
+        Ok(o) if o.status.success() => format!("已终止安装进程 {pid}"),
+        Ok(o) => format!("终止进程返回 {}", o.status),
+        Err(e) => return Err(format!("终止安装进程失败：{e}")),
+    };
+    log_line(&app, "cancel", &format!("{tool_id}: {msg}"));
+    Ok(msg)
+}
+
+#[tauri::command]
 async fn install_tool(
     app: AppHandle,
     tool_id: String,
@@ -609,6 +692,9 @@ async fn install_tool(
 ) -> Result<String, String> {
     validate_id(&tool_id)?;
     validate_id(&winget_id)?;
+
+    // 清掉上一次同 ID 的取消标记，否则这次一开始就被判为已取消
+    clear_cancel(&app, &tool_id);
 
     let location = install_location
         .map(|p| p.trim().to_string())
@@ -681,10 +767,15 @@ async fn install_tool(
     }
 
     if !ok {
+        let was_cancelled = cancel_requested(&app, &tool_id);
         log_line(
             &app,
             "install",
-            &format!("失败 {name}: {}", log.chars().take(500).collect::<String>()),
+            &format!(
+                "{} {name}: {}",
+                if was_cancelled { "已取消" } else { "失败" },
+                log.chars().take(500).collect::<String>()
+            ),
         );
         let (rolled, _) = run_winget_stream(
             &app,
@@ -701,6 +792,15 @@ async fn install_tool(
             "install-progress",
         )
         .await?;
+        clear_cancel(&app, &tool_id);
+        // 用户主动取消不是"失败"，不要拿 winget 的堆栈去糊用户一脸
+        if was_cancelled {
+            return Err(format!(
+                "已取消 {} 的安装{}",
+                name,
+                if rolled { "，残留已清理" } else { "" }
+            ));
+        }
         let suffix = if rolled {
             "；已自动回滚清理残留"
         } else {
@@ -732,8 +832,10 @@ async fn install_tool(
 
     // 安装成功后：定位真实 exe 并建桌面快捷方式
     let mut notes: Vec<String> = Vec::new();
+    let mut actual_location: Option<String> = None;
     match lookup_app(&app, &name).await {
         Some(target) => {
+            actual_location = target.install_location.clone();
             if let Some(lnk) = create_shortcut(&app, &name, &target).await {
                 let file = Path::new(&lnk)
                     .file_name()
@@ -746,13 +848,50 @@ async fn install_tool(
         }
         None => notes.push("未能定位程序路径，快捷方式已跳过".into()),
     }
-    if location.is_some() && used_location {
-        notes.push("已装到自定义位置".into());
-    } else if location.is_some() {
-        notes.push("该工具不支持自定义位置，已装到默认路径".into());
-    }
+
+    // 位置提示必须来自注册表回读，不能信 winget 的退出码：
+    // 大量 MSI 会静默忽略 --location 却仍然返回 0，用户选 D 盘却装进 C 盘。
+    notes.push(describe_location(
+        location.as_deref(),
+        actual_location.as_deref(),
+        used_location,
+    ));
+    log_line(
+        &app,
+        "install",
+        &format!(
+            "位置核对 {name}: 请求={location:?} 实际={actual_location:?} used_location={used_location}"
+        ),
+    );
 
     Ok(format!("{} 安装成功（{}）", name, notes.join("；")))
+}
+
+/// 把「请求的安装位置」与「注册表回读的真实位置」比对成一句人话。
+fn describe_location(requested: Option<&str>, actual: Option<&str>, used_location: bool) -> String {
+    let Some(req) = requested else {
+        return match actual {
+            Some(a) => format!("已安装到 {a}"),
+            None => "已安装到默认位置".into(),
+        };
+    };
+    let Some(act) = actual else {
+        // 回读不到：只能如实说是推测值，不要给出"已装到自定义位置"这种臆断
+        return if used_location {
+            "安装器未报告安装目录，无法确认是否采用了你选择的路径".into()
+        } else {
+            "该工具不支持自定义位置，已装到默认路径".into()
+        };
+    };
+    let norm = |s: &str| s.trim().trim_end_matches(['\\', '/']).to_lowercase();
+    let (n_req, n_act) = (norm(req), norm(act));
+    if n_req == n_act || n_act.starts_with(&format!("{n_req}\\")) {
+        format!("已装到自定义位置 {act}")
+    } else if used_location {
+        format!("该安装器忽略了你指定的目录，实际装在 {act}")
+    } else {
+        format!("该工具不支持自定义位置，实际装在 {act}")
+    }
 }
 
 #[tauri::command]
@@ -860,7 +999,10 @@ fn parse_package_table(stdout: &str) -> Vec<InstalledPackage> {
             && t.chars().any(|c| c.is_ascii_alphabetic())
     }
     fn is_version(t: &str) -> bool {
-        t.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+        t.chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
             && t.chars()
                 .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == '_')
     }
@@ -871,7 +1013,7 @@ fn parse_package_table(stdout: &str) -> Vec<InstalledPackage> {
         if trimmed.is_empty()
             || trimmed.starts_with('-')
             || trimmed.starts_with('\\')
-            || trimmed.starts_with('=') 
+            || trimmed.starts_with('=')
         {
             continue;
         }
@@ -1576,6 +1718,37 @@ Microsoft Visual C++ 2015 UWP Desktop Runtime Package        Microsoft.VCLibs.De
         assert!(APP_LOOKUP_PS1.chars().any(|c| c as u32 > 0x2E80));
         assert!(MAKE_SHORTCUT_PS1.chars().any(|c| c as u32 > 0x2E80));
     }
+
+    /// 注册表回读值必须决定提示文案，不能靠 winget 退出码臆断"已装到自定义位置"。
+    #[test]
+    fn describe_location_compares_requested_with_registry_value() {
+        // 一致（忽略大小写与尾部分隔符）
+        assert_eq!(
+            describe_location(Some("D:\\Apps\\Foo"), Some("d:\\apps\\foo\\"), true),
+            "已装到自定义位置 d:\\apps\\foo\\"
+        );
+        // MSI 静默忽略 --location 但 winget 返回 0：必须如实说"忽略了你指定的目录"
+        assert_eq!(
+            describe_location(Some("D:\\Apps\\Foo"), Some("C:\\Program Files\\Foo"), true),
+            "该安装器忽略了你指定的目录，实际装在 C:\\Program Files\\Foo"
+        );
+        // 不支持自定义位置
+        assert_eq!(
+            describe_location(Some("D:\\Apps\\Foo"), Some("C:\\Program Files\\Foo"), false),
+            "该工具不支持自定义位置，实际装在 C:\\Program Files\\Foo"
+        );
+        // 回读不到：不能凭空断言装到了自定义位置
+        assert_eq!(
+            describe_location(Some("D:\\Apps\\Foo"), None, true),
+            "安装器未报告安装目录，无法确认是否采用了你选择的路径"
+        );
+        // 未请求自定义位置
+        assert_eq!(
+            describe_location(None, Some("C:\\Program Files\\Foo"), false),
+            "已安装到 C:\\Program Files\\Foo"
+        );
+        assert_eq!(describe_location(None, None, false), "已安装到默认位置");
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1591,8 +1764,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(RunRegistry::default())
         .invoke_handler(tauri::generate_handler![
             install_tool,
+            cancel_install,
             uninstall_tool,
             list_installed,
             persist_installed,

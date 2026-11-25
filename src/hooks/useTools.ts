@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { TOOLS, type CategoryId, type Tool, BUNDLES } from '../data/tools';
 import {
   installTool,
+  cancelInstall as cancelInstallApi,
   listInstalled,
   persistInstalled,
   uninstallTool,
@@ -15,6 +16,7 @@ import {
   type UpgradableInfo,
 } from '../lib/api';
 import { searchTools, rankByDownloads } from '../lib/search';
+import { useDownloadsLive } from '../lib/downloadsLive';
 
 export type View = 'all' | 'featured' | 'installed' | 'favorites' | CategoryId;
 export type InstallPhase = 'idle' | 'preview' | 'installing' | 'done' | 'error';
@@ -29,6 +31,8 @@ export interface InstallState {
   percent: number;
   /** 当前阶段：download / install / done */
   phase_hint: string;
+  /** 是否已发出取消请求（UI 显示"正在取消…"并禁用按钮） */
+  cancelling?: boolean;
 }
 
 const initialInstall: InstallState = { phase: 'idle', tool: null, message: '', location: '', percent: 0, phase_hint: '' };
@@ -62,6 +66,8 @@ export function useTools(defaultLocation = '') {
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [upgrading, setUpgrading] = useState(false);
   const [launching, setLaunching] = useState<string | null>(null);
+  // 后台刷新到新下载量后，让分类/全部视图重排
+  const { version: downloadsVersion } = useDownloadsLive();
 
   /** 用 winget list 校准已安装集合：用户自己装的能显示、手动卸载的会消失 */
   const refreshInstalled = useCallback(async () => {
@@ -90,7 +96,7 @@ export function useTools(defaultLocation = '') {
     const isCategoryView = view !== 'installed' && view !== 'favorites';
     if (isCategoryView) return rankByDownloads(hits.map((h) => h.tool));
     return hits.map((h) => h.tool);
-  }, [view, query, installed, favorites]);
+  }, [view, query, installed, favorites, downloadsVersion]);
 
   const toggleFavorite = useCallback((id: string) => {
     setFavorites((prev) => {
@@ -143,8 +149,23 @@ export function useTools(defaultLocation = '') {
       phase: result.ok ? 'done' : 'error',
       message: result.message,
       percent: result.ok ? 100 : prev.percent,
+      cancelling: false,
     }));
   }, [install.tool, install.location, markInstalled]);
+
+  /** 取消正在进行的安装：先置 UI 为取消中，再让 Rust 结束进程树 */
+  const cancelInstall = useCallback(async () => {
+    const tool = install.tool;
+    if (!tool || install.phase !== 'installing') return;
+    setInstall((prev) => ({ ...prev, cancelling: true, message: '正在终止安装进程…' }));
+    const r = await cancelInstallApi(tool.id);
+    if (!r.ok) {
+      setToast(`取消失败：${r.message}`);
+      setInstall((prev) => ({ ...prev, cancelling: false }));
+    }
+    // 成功时不必改动 phase：install_tool 的 Promise 很快会以取消原因 reject，
+    // 由 confirmInstall 统一落到 error 分支并显示"已取消…"
+  }, [install.tool, install.phase]);
 
   /** 启动已安装的工具（Rust 侧按 DisplayName 定位真实 exe） */
   const launchTool = useCallback(async (tool: Tool) => {
@@ -287,7 +308,7 @@ export function useTools(defaultLocation = '') {
   return {
     view, setView, query, setQuery, filtered, installed, favorites, toggleFavorite,
     selected, setSelected,
-    install, openPreview, confirmInstall, closeInstall, setInstallLocation,
+    install, openPreview, confirmInstall, closeInstall, setInstallLocation, cancelInstall,
     uninstallTargets, uninstalling, uninstallProgress, requestUninstall, doUninstall, cancelUninstall,
     toast, closeToast,
     loadingBundle, installBundle, installTools,

@@ -580,6 +580,52 @@ export const RELEASE_COUNTS: Record<string, number> = {
 
 export const DOWNLOADS_FETCHED_AT = '2026-11-24T15:34:15Z';
 
+/**
+ * 后台刷新得到的新数据，只覆盖有更新的工具 id。
+ * 内置快照是「出厂值」，网络不可用时排行仍可用；拿到新值后覆盖内存并通知 UI。
+ */
+let live: Record<string, number> | null = null;
+let fetchedAt = DOWNLOADS_FETCHED_AT;
+/** 每次合并新数据自增；useSyncExternalStore 要求 getSnapshot 返回可变且不可变的值 */
+let version = 0;
+
+type Listener = () => void;
+const listeners = new Set<Listener>();
+
+/** 合并一批新下载量并通知订阅者（同一 id 以后到的值为准） */
+export function setLiveDownloads(map: Record<string, number>, at?: string) {
+  if (Object.keys(map).length === 0 && !at) return;
+  live = { ...(live ?? {}), ...map };
+  if (at) fetchedAt = at;
+  version += 1;
+  for (const fn of listeners) fn();
+}
+
+/** 单调递增的数据版本号，作为 React 的外部快照 */
+export function downloadsVersion(): number {
+  return version;
+}
+
+/** 订阅排行榜数据变化，返回取消订阅函数 */
+export function subscribeDownloads(fn: Listener): () => void {
+  listeners.add(fn);
+  return () => {
+    listeners.delete(fn);
+  };
+}
+
+/** 当前数据时间（内置快照时间或最近一次刷新时间） */
+export function currentFetchedAt(): string {
+  return fetchedAt;
+}
+
+/** 有多少条来自后台刷新，用于设置页展示数据新鲜度 */
+export function liveDownloadCount(): number {
+  return live ? Object.keys(live).length : 0;
+}
+
 export function downloadsOf(toolId: string): number {
+  const fresh = live?.[toolId];
+  if (typeof fresh === 'number') return fresh;
   return DOWNLOADS[toolId] ?? 0;
 }

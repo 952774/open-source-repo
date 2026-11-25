@@ -1,9 +1,9 @@
 /** 设置页 + 排行榜 */
 import { useEffect, useMemo, useState } from 'react';
 import { CATEGORIES, TOOLS, getCategory, type Tool } from '../data/tools';
-import { DOWNLOADS_FETCHED_AT } from '../data/downloads';
 import { rankByDownloads, rankByStars, parseStars, formatDownloads } from '../lib/search';
 import { downloadsOf } from '../data/downloads';
+import { useDownloadsLive } from '../lib/downloadsLive';
 import type { Lang } from '../lib/i18n';
 import type { AppSettings } from '../hooks/useSettings';
 import {
@@ -301,6 +301,7 @@ type RankTab = 'downloads' | 'stars' | 'fresh' | 'featured';
 export function RankView({ lang, onOpen }: { lang: Lang; onOpen: (t: Tool) => void }) {
   const [tab, setTab] = useState<RankTab>('downloads');
   const [cat, setCat] = useState<string>('all');
+  const { fetchedAt, liveCount } = useDownloadsLive();
 
   const list = useMemo(() => {
     let base = TOOLS;
@@ -316,7 +317,7 @@ export function RankView({ lang, onOpen }: { lang: Lang; onOpen: (t: Tool) => vo
         .slice(0, 30);
     }
     return base.filter((t) => t.featured);
-  }, [tab, cat]);
+  }, [tab, cat, liveCount]);
 
   const tabs: Array<[RankTab, string, string]> = [
     ['downloads', '📥', zh(lang) ? '下载榜' : 'Downloads'],
@@ -331,8 +332,8 @@ export function RankView({ lang, onOpen }: { lang: Lang; onOpen: (t: Tool) => vo
         <h2>{zh(lang) ? '软件榜单' : 'Rankings'}</h2>
         <p>
           {zh(lang)
-            ? `下载榜统计各工具 GitHub Release 资产的真实下载次数（数据时间 ${DOWNLOADS_FETCHED_AT}）——star 代表关注，下载才代表真的有人装。`
-            : `The download ranking sums real download counts across each project's GitHub releases (fetched ${DOWNLOADS_FETCHED_AT}). Stars show interest; downloads show actual installs.`}
+            ? `下载榜统计各工具 GitHub Release 资产的真实下载次数（数据时间 ${fetchedAt}${liveCount > 0 ? `，已后台刷新 ${liveCount} 款` : ''}）——star 代表关注，下载才代表真的有人装。`
+            : `The download ranking sums real download counts across each project's GitHub releases (fetched ${fetchedAt}${liveCount > 0 ? `, ${liveCount} refreshed in background` : ''}). Stars show interest; downloads show actual installs.`}
         </p>
       </div>
 

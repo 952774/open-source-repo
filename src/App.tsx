@@ -419,9 +419,10 @@ function NetworkErrorCard({ message, lang }: { message: string; lang: Lang }) {
   );
 }
 
-function InstallModal({ state, onConfirm, onClose, onLocationChange, T, lang }: {
+function InstallModal({ state, onConfirm, onClose, onLocationChange, onCancelInstall, T, lang }: {
   state: ReturnType<typeof useTools>['install']; onConfirm: () => void; onClose: () => void;
   onLocationChange: (v: string) => void;
+  onCancelInstall: () => void;
   T: (k: StringKey) => string;
   lang: Lang;
 }) {
@@ -495,6 +496,16 @@ function InstallModal({ state, onConfirm, onClose, onLocationChange, T, lang }: 
               <b>{state.percent}%</b>
             </div>
             {state.message && <div className="progress-text">{state.message}</div>}
+            <div className="modal-actions">
+              <button
+                className="btn-ghost btn-danger"
+                onClick={onCancelInstall}
+                disabled={state.cancelling}
+                title={T('cancelInstallTip')}
+              >
+                {state.cancelling ? T('cancelling') : T('cancelInstall')}
+              </button>
+            </div>
           </>
         )}
         {(phase === 'done' || phase === 'error') && (
@@ -895,7 +906,7 @@ export default function App() {
       </main>
       {sidebarOpen && <div className="sidebar-scrim" onClick={() => setSidebarOpen(false)} />}
 
-      {s.install.phase !== 'idle' && <InstallModal state={s.install} onConfirm={s.confirmInstall} onClose={s.closeInstall} onLocationChange={s.setInstallLocation} T={T} lang={lang} />}
+      {s.install.phase !== 'idle' && <InstallModal state={s.install} onConfirm={s.confirmInstall} onClose={s.closeInstall} onLocationChange={s.setInstallLocation} onCancelInstall={s.cancelInstall} T={T} lang={lang} />}
       {s.uninstallTargets && <UninstallModal tools={s.uninstallTargets} busy={s.uninstalling}
         onConfirm={(clean) => s.doUninstall(clean)} onCancel={s.cancelUninstall}
         cleanConfig={cleanConfig} setCleanConfig={setCleanConfig} T={T} progress={s.uninstallProgress} />}

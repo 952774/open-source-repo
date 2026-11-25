@@ -154,10 +154,23 @@ if ($hits.Count -gt 0) { $dn = [string]$hits[0].DisplayName }
 $workdir = $null
 if ($found) { $workdir = Split-Path -Parent $found }
 
+# 注册表里的 InstallLocation 是判断"实际装到哪了"的唯一可靠来源。
+# 很多 MSI 静默忽略 winget 的 --location 却仍返回 0，
+# 所以安装后必须回读这个值再和用户选的目标目录比对。
+$loc = $null
+foreach ($e in $hits) {
+  if ($e.InstallLocation) {
+    $cand = ([string]$e.InstallLocation).Trim().Trim('"')
+    if ($cand -and (Test-Path -LiteralPath $cand)) { $loc = $cand; break }
+  }
+}
+if (-not $loc -and $found) { $loc = $workdir }
+
 $obj = [ordered]@{
-  exe         = $found
-  workdir     = $workdir
-  displayName = $dn
-  source      = $src
+  exe             = $found
+  workdir         = $workdir
+  displayName     = $dn
+  installLocation = $loc
+  source          = $src
 }
 Write-Output ($obj | ConvertTo-Json -Compress)

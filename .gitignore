@@ -8,3 +8,4 @@ reports/
 .tmp/
 .github/workflows/
 .git-askpass.cmd
+.release-notes-*.txt

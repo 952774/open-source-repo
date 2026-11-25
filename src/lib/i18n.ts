@@ -28,6 +28,7 @@ export const STRINGS = {
     submitHint: '生成符合收录规范的 manifest，复制后到 GitHub 建 Issue 提交',
     submitOk: '已生成 manifest 片段，复制后到 GitHub 仓库新建 Issue 粘贴即可',
     openApp: '打开', downloads: '下载量', networkProxy: '网络代理',
+    cancelInstall: '取消安装', cancelling: '正在取消…', cancelInstallTip: '会终止 winget 与安装器进程，并清理已写入的残留',
   },
   en: {
     workspace: 'Workspace', categories: 'Categories', featured: 'Featured', all: 'All Tools', installed: 'Installed',
@@ -55,6 +56,7 @@ export const STRINGS = {
     submitHint: 'Generates a manifest that follows the inclusion rules — paste it into a GitHub issue',
     submitOk: 'Manifest generated. Paste it into a new issue on the GitHub repo.',
     openApp: 'Open', downloads: 'Downloads', networkProxy: 'Network proxy',
+    cancelInstall: 'Cancel install', cancelling: 'Cancelling…', cancelInstallTip: 'Terminates winget and the installer, then cleans up leftovers',
   },
 } as const;
 
