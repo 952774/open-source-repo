@@ -16,13 +16,14 @@ import {
   isTauri,
 } from './lib/api';
 import { SceneGuide, CompareView, ConfigView, SubmitView } from './components/ExtraViews';
+import { LocalView } from './components/LocalView';
 import { SettingsView, RankView } from './components/Views';
 import pkg from '../package.json';
 
 /** 构建期版本号：与 package.json 保持单一来源，避免底部版本号滞后 */
 const APP_VERSION: string = (pkg as { version?: string }).version ?? '0.0.0';
 
-type ExtraView = 'none' | 'scene' | 'compare' | 'config' | 'submit' | 'rank' | 'settings';
+type ExtraView = 'none' | 'scene' | 'compare' | 'config' | 'submit' | 'rank' | 'settings' | 'local';
 
 /** 分类英文名（避免直接拼音化显示） */
 const CATEGORY_EN: Record<string, string> = {
@@ -93,13 +94,15 @@ function Sidebar({
       {nav('all', '📚', T('all'), total)}
       {nav('installed', '✅', T('installed'), installed.size)}
       {nav('favorites', '❤️', lang === 'zh' ? '我的收藏' : 'Favorites', favorites.size)}
+      {extraNav('local', '💻', lang === 'zh' ? '本机软件' : 'On This PC')}
       <div className="nav-label">{T('categories')}</div>
       {CATEGORIES.map((c) => nav(c.id, c.icon, lang === 'zh' ? c.name : (CATEGORY_EN[c.id] ?? c.name)))}
-      <div className="nav-label">Tools</div>
+      <div className="nav-label">{lang === 'zh' ? '工具' : 'Tools'}</div>
       {extraNav('scene', '🧭', T('sceneGuide'))}
       {extraNav('compare', '⚖️', T('compare'))}
       {extraNav('config', '💾', T('configBackup'))}
       {extraNav('submit', '🤝', T('submit'))}
+      <div className="nav-label">{lang === 'zh' ? '应用' : 'App'}</div>
       {extraNav('settings', '⚙️', lang === 'zh' ? '设置' : 'Settings')}
       <button className="check-update-btn" onClick={() => updater.checkUpdate()} disabled={updater.state.phase === 'checking'}>
         <span>⬆️</span>{updater.state.phase === 'checking' ? T('checking') : (lang === 'zh' ? '检查应用更新' : 'Check app update')}
@@ -158,20 +161,14 @@ function ToolCard({
   onUninstall: () => void; onOpen: () => void; lang: Lang; hasUpdate?: boolean;
   isFavorite?: boolean; onToggleFavorite?: () => void; query?: string;
 }) {
-  const stars = tool.stars;
   const iconUrl = (tool as Tool & { iconUrl?: string }).iconUrl;
   const displayName = lang === 'en' ? ((tool as Tool & { nameEn?: string }).nameEn ?? tool.name) : tool.name;
   const dl = downloadsOf(tool.id);
+  const zh = lang === 'zh';
+  const cat = getCategory(tool.category);
+  const catName = zh ? cat.name : (CATEGORY_EN[cat.id] ?? cat.name);
   return (
     <div className="tool-card" onClick={onDetail}>
-      <span className="detail-hint">{lang === 'zh' ? '详情' : 'Details'} →</span>
-      <button
-        className={`fav-btn${isFavorite ? ' on' : ''}`}
-        title={isFavorite ? (lang === 'zh' ? '取消收藏' : 'Unfavorite') : (lang === 'zh' ? '收藏' : 'Favorite')}
-        onClick={(e) => { e.stopPropagation(); onToggleFavorite?.(); }}
-      >
-        {isFavorite ? '❤️' : '🤍'}
-      </button>
       <div className="tool-top">
         <div className="tool-icon">
           <span className="emoji-fallback">{tool.icon}</span>
@@ -180,30 +177,42 @@ function ToolCard({
               onError={(e) => { e.currentTarget.style.display = 'none'; }} />
           )}
         </div>
-        <div>
+        <div className="tool-head">
           <div className="tool-name"><Highlight text={displayName} query={query} /></div>
-          <div className="tool-license">✓ {tool.license}{stars && stars !== '—' ? ` · ★ ${stars}` : ''}</div>
+          <div className="tool-sub">
+            {catName}
+            {dl > 0 ? ` · ${formatDownloads(dl)} ${zh ? '次下载' : 'downloads'}` : ''}
+          </div>
         </div>
-      </div>
-      <p className="tool-desc"><Highlight text={tool.description} query={query} /></p>
-      <div className="tool-bottom">
-        <span className="tag verified">✓ {lang === 'zh' ? '已验证开源' : 'Verified OSS'}</span>
-        {hasUpdate
-          ? <span className="tag update">⬆ {lang === 'zh' ? '有新版' : 'Update'}</span>
-          : <span className={`tag ${isInstalled ? 'green' : ''}`}>{isInstalled ? (lang === 'zh' ? '已安装' : 'Installed') : getCategory(tool.category).name}</span>}
-        {dl > 0 && <span className="tag dl">📥 {formatDownloads(dl)}</span>}
-        {tool.featured && <span className="tag">⭐</span>}
-      </div>
-      <div className="card-actions">
-        {isInstalled && (
-          <button className="btn-launch" onClick={(e) => { e.stopPropagation(); onOpen(); }}>
-            {lang === 'zh' ? '打开' : 'Open'}
-          </button>
-        )}
-        <button className={`btn-install ${isInstalled ? 'installed' : ''}`}
-          onClick={(e) => { e.stopPropagation(); isInstalled ? onUninstall() : onInstall(); }}>
-          {isInstalled ? (lang === 'zh' ? '卸载' : 'Uninstall') : (lang === 'zh' ? '一键安装' : 'Install')}
+        <button
+          className={`fav-btn${isFavorite ? ' on' : ''}`}
+          title={isFavorite ? (zh ? '取消收藏' : 'Unfavorite') : (zh ? '收藏' : 'Favorite')}
+          onClick={(e) => { e.stopPropagation(); onToggleFavorite?.(); }}
+        >
+          {isFavorite ? '❤️' : '🤍'}
         </button>
+      </div>
+
+      <p className="tool-desc"><Highlight text={tool.description} query={query} /></p>
+
+      <div className="tool-foot">
+        <div className="tool-meta">
+          <span className="tag verified">✓ {zh ? '开源' : 'OSS'}</span>
+          <span className="tag gray">{tool.license}</span>
+          {hasUpdate && <span className="tag update">⬆ {zh ? '有新版' : 'Update'}</span>}
+          {isInstalled && !hasUpdate && <span className="tag green">{zh ? '已安装' : 'Installed'}</span>}
+        </div>
+        <div className="card-actions">
+          {isInstalled && (
+            <button className="btn-card btn-card-ghost" onClick={(e) => { e.stopPropagation(); onOpen(); }}>
+              {zh ? '打开' : 'Open'}
+            </button>
+          )}
+          <button className={`btn-card ${isInstalled ? 'btn-card-danger' : 'btn-card-primary'}`}
+            onClick={(e) => { e.stopPropagation(); isInstalled ? onUninstall() : onInstall(); }}>
+            {isInstalled ? (zh ? '卸载' : 'Uninstall') : (zh ? '获取' : 'GET')}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -566,8 +575,43 @@ function UninstallModal({ tools, busy, onConfirm, onCancel, cleanConfig, setClea
   );
 }
 
-function UpdateModal({ state, onInstall, onClose, T, lang, appVersion }: {
-  state: ReturnType<typeof useUpdater>['state']; onInstall: () => void; onClose: () => void;
+/**
+ * 安装残留处置弹窗
+ *
+ * 打开失败但注册表里还留着条目（典型：用户手动删了安装目录，或安装器中途崩了），
+ * 这时只报一句"未找到启动程序"没有任何意义——用户需要的是一个能立刻收尾的动作。
+ */
+function StaleModal({ name, message, onPurge, onClose, lang }: {
+  name: string; message: string; onPurge: () => void; onClose: () => void; lang: Lang;
+}) {
+  const zh = lang === 'zh';
+  return (
+    <>
+      <div className="overlay" onClick={onClose} />
+      <div className="modal">
+        <div className="modal-head">
+          <span className="mi">🧹</span>
+          <div>
+            <h3>{zh ? '发现安装残留' : 'Installation leftover'}</h3>
+            <p>{name}</p>
+          </div>
+        </div>
+        <div className="notice warn">{message}</div>
+        <p className="loc-tip" style={{ marginTop: 12 }}>
+          {zh
+            ? '清理会移除注册表里这条软件留下的卸载条目，以及确认没有程序文件的空目录。不会动其它软件，也不会删你的个人文件。'
+            : 'Cleanup removes this program’s leftover uninstall entry and any empty folders with no executables left. Nothing else is touched.'}
+        </p>
+        <div className="modal-actions">
+          <button className="btn-ghost" onClick={onClose}>{zh ? '先不管' : 'Not now'}</button>
+          <button className="btn-danger" onClick={onPurge}>{zh ? '清理残留' : 'Clean up'}</button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function UpdateModal({ state, onInstall, onClose, T, lang, appVersion }: {  state: ReturnType<typeof useUpdater>['state']; onInstall: () => void; onClose: () => void;
   T: (k: StringKey) => string; lang: Lang; appVersion: string;
 }) {
   const zh = lang === 'zh';
@@ -794,6 +838,16 @@ export default function App() {
           {extra === 'config' && <ConfigView t={T} />}
           {extra === 'submit' && <SubmitView t={T} lang={lang} />}
           {extra === 'rank' && <RankView lang={lang} onOpen={openDetail} />}
+          {extra === 'local' && (
+            <LocalView
+              lang={lang}
+              apps={s.localApps}
+              scanning={s.scanningLocal}
+              onRescan={() => void s.refreshLocalApps()}
+              onPurge={(name) => void s.purgeStaleApp(name)}
+              onOpenTool={(id) => { const t = TOOLS.find((x) => x.id === id); if (t) openDetail(t); }}
+            />
+          )}
           {extra === 'settings' && (
             <SettingsView settings={settings} update={updateSetting} reset={resetSettings}
               lang={lang} onOpenTool={openDetail}
@@ -913,6 +967,15 @@ export default function App() {
       {(updater.state.phase !== 'idle' || !!updater.state.message) && (
         <UpdateModal state={updater.state} onInstall={updater.installUpdate} onClose={updater.reset}
           T={T} lang={lang} appVersion={appVersion} />
+      )}
+      {s.stalePrompt && (
+        <StaleModal
+          name={s.stalePrompt.name}
+          message={s.stalePrompt.message}
+          onPurge={() => void s.purgeStaleApp(s.stalePrompt!.name)}
+          onClose={s.dismissStalePrompt}
+          lang={lang}
+        />
       )}
       {s.toast && <div className="toast" onClick={s.closeToast}>{s.toast}</div>}
     </div>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { TOOLS, type CategoryId, type Tool, BUNDLES } from '../data/tools';
 import {
   installTool,
@@ -12,11 +12,15 @@ import {
   loadFavorites,
   persistFavorites,
   scanInstalled,
+  scanLocalApps,
+  purgeStale,
   openTool,
   type UpgradableInfo,
+  type LocalApp,
 } from '../lib/api';
 import { searchTools, rankByDownloads } from '../lib/search';
 import { useDownloadsLive } from '../lib/downloadsLive';
+import { buildLocalIndex, installedFromLocal } from '../lib/localMatch';
 
 export type View = 'all' | 'featured' | 'installed' | 'favorites' | CategoryId;
 export type InstallPhase = 'idle' | 'preview' | 'installing' | 'done' | 'error';
@@ -66,23 +70,62 @@ export function useTools(defaultLocation = '') {
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [upgrading, setUpgrading] = useState(false);
   const [launching, setLaunching] = useState<string | null>(null);
+  // 本机注册表扫描出的全部软件（不限于清单收录），「本机软件」视图用
+  const [localApps, setLocalApps] = useState<LocalApp[]>([]);
+  const [scanningLocal, setScanningLocal] = useState(false);
+  // 打开失败但被判定为安装残留时，弹一键清理
+  const [stalePrompt, setStalePrompt] = useState<{ name: string; message: string } | null>(null);
   // 后台刷新到新下载量后，让分类/全部视图重排
   const { version: downloadsVersion } = useDownloadsLive();
 
-  /** 用 winget list 校准已安装集合：用户自己装的能显示、手动卸载的会消失 */
+  const localIndex = useMemo(buildLocalIndex, []);
+  // 手动标记的已安装（本次会话内安装成功的），registry 扫描可能还没跟上
+  const markedRef = useRef<Set<string>>(new Set());
+
+  /**
+   * 校准已安装集合。两个来源合并：
+   *   1. winget list —— 认 winget 数据库里的包
+   *   2. 注册表 ARP 扫描 —— 认官方安装包/绿色版/手动装的开源软件
+   * 只靠 winget 会把用户自己装好的 VS Code、Git 显示成"未安装"。
+   */
   const refreshInstalled = useCallback(async () => {
-    const local = await listInstalled();
-    const packages = await scanInstalled();
-    const next = calibrate(local, packages);
-    setInstalled(next);
+    const [local, packages, apps] = await Promise.all([listInstalled(), scanInstalled(), scanLocalApps()]);
+    setLocalApps(apps);
+    const merged = calibrate(local, packages);
+    for (const id of installedFromLocal(apps, localIndex)) merged.add(id);
+    for (const id of markedRef.current) merged.add(id);
+    setInstalled(merged);
     // 校准结果回写，下次冷启动在 winget 不可用时仍有可用缓存
-    if (packages !== null) persistInstalled([...next]);
-    return next;
-  }, []);
+    if (packages !== null || apps.length > 0) persistInstalled([...merged]);
+    return merged;
+  }, [localIndex]);
 
   useEffect(() => {
     void refreshInstalled();
   }, [refreshInstalled]);
+
+  /**
+   * 只重扫注册表（「本机软件」页的刷新按钮）。
+   * 会把新发现的收录工具并入已安装集合，但不会移除 winget 认为装着的项。
+   */
+  const refreshLocalApps = useCallback(async () => {
+    setScanningLocal(true);
+    try {
+      const apps = await scanLocalApps();
+      setLocalApps(apps);
+      const found = installedFromLocal(apps, localIndex);
+      if (found.size > 0) {
+        setInstalled((prev) => {
+          const next = new Set(prev);
+          for (const id of found) next.add(id);
+          return next;
+        });
+      }
+      return apps;
+    } finally {
+      setScanningLocal(false);
+    }
+  }, [localIndex]);
 
   const filtered = useMemo(() => {
     let list = TOOLS;
@@ -109,6 +152,8 @@ export function useTools(defaultLocation = '') {
   }, []);
 
   const markInstalled = useCallback((id: string) => {
+    // 记进 markedRef：注册表扫描有延迟，刚装完的不能被下一次 refresh 抹掉
+    markedRef.current.add(id);
     setInstalled((prev) => {
       const next = new Set(prev);
       next.add(id);
@@ -172,8 +217,27 @@ export function useTools(defaultLocation = '') {
     setLaunching(tool.id);
     const r = await openTool(tool.name, tool.id);
     setLaunching(null);
-    if (!r.ok) setToast(`启动失败：${r.message}`);
+    if (r.ok) return;
+    // 定位失败且被判定为安装残留：不弹干巴巴的错误，直接给一键清理入口
+    if (r.stale) {
+      setStalePrompt({ name: r.staleName || tool.name, message: r.message });
+      return;
+    }
+    setToast(`启动失败：${r.message}`);
   }, []);
+
+  /** 清理安装残留，然后重新扫描本机软件 */
+  const purgeStaleApp = useCallback(async (name: string) => {
+    const r = await purgeStale(name);
+    setStalePrompt(null);
+    setToast(r.ok ? r.message : `清理失败：${r.message}`);
+    if (r.ok) {
+      await Promise.all([refreshInstalled(), refreshLocalApps()]);
+    }
+    return r;
+  }, [refreshInstalled, refreshLocalApps]);
+
+  const dismissStalePrompt = useCallback(() => setStalePrompt(null), []);
 
   /** 请求卸载：弹二次确认，不立即执行 */
   const requestUninstall = useCallback((tools: Tool | Tool[]) => {
@@ -214,6 +278,7 @@ export function useTools(defaultLocation = '') {
       });
       if (result.ok) {
         okCount++;
+        markedRef.current.delete(tool.id);
         setInstalled((prev) => {
           const next = new Set(prev);
           next.delete(tool.id);
@@ -314,6 +379,8 @@ export function useTools(defaultLocation = '') {
     loadingBundle, installBundle, installTools,
     upgradable, checkingUpdates, upgrading, checkUpdates, doUpgrade,
     launching, launchTool, refreshInstalled,
+    localApps, scanningLocal, refreshLocalApps,
+    stalePrompt, purgeStaleApp, dismissStalePrompt,
     isTauri: isTauri(),
     total: TOOLS.length,
   };

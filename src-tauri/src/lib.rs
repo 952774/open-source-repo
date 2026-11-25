@@ -479,6 +479,8 @@ fn install_args(winget_id: &str, location: Option<&str>) -> Vec<String> {
 
 const APP_LOOKUP_PS1: &str = include_str!("app_lookup.ps1");
 const MAKE_SHORTCUT_PS1: &str = include_str!("make_shortcut.ps1");
+const SCAN_LOCAL_PS1: &str = include_str!("scan_local.ps1");
+const PURGE_STALE_PS1: &str = include_str!("purge_stale.ps1");
 
 /// 把脚本正文编码成落盘字节：UTF-8 BOM + 正文。
 ///
@@ -553,6 +555,15 @@ pub struct AppTarget {
     /// 注册表 InstallLocation 回读值；用来核实"用户选的目录"是否真被安装器采纳
     #[serde(rename = "installLocation", default)]
     install_location: Option<String>,
+    /// 注册表里的卸载命令，残留清理时回显给用户
+    #[serde(rename = "uninstallString", default)]
+    uninstall_string: Option<String>,
+    /// 注册表有条目但主程序文件已不存在（安装残留）
+    #[serde(default)]
+    stale: Option<bool>,
+    /// 命中的卸载注册表条目数
+    #[serde(default)]
+    matches: Option<u32>,
     source: Option<String>,
 }
 
@@ -654,6 +665,131 @@ async fn create_shortcut(app: &AppHandle, name: &str, target: &AppTarget) -> Opt
 // ─────────────────────────────────────────────────────────────
 // 命令：安装 / 卸载
 // ─────────────────────────────────────────────────────────────
+
+/// 本机扫描出的一条软件记录（来自注册表 ARP 与 App Paths）
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LocalApp {
+    pub name: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub publisher: String,
+    #[serde(rename = "installLocation", default)]
+    pub install_location: Option<String>,
+    #[serde(default)]
+    pub exe: Option<String>,
+    #[serde(default)]
+    pub homepage: String,
+    #[serde(rename = "uninstallString", default)]
+    pub uninstall_string: String,
+    #[serde(default)]
+    pub scope: String,
+    /// 注册表有条目但找不到程序文件 = 安装残留
+    #[serde(default)]
+    pub stale: bool,
+}
+
+/// 残留清理结果
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PurgeResult {
+    #[serde(default)]
+    pub removed: usize,
+    #[serde(default)]
+    pub keys: Vec<String>,
+    #[serde(default)]
+    pub dirs: Vec<String>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+/// 扫描本机注册表里的全部软件（含未收录在 ToolArk 清单里的）
+#[tauri::command]
+async fn scan_local_apps(app: AppHandle) -> Result<Vec<LocalApp>, String> {
+    let out = run_ps1(&app, "scan_local.ps1", SCAN_LOCAL_PS1, &[]).await?;
+    let line = out
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('[') || l.trim_start().starts_with('{'))
+        .ok_or_else(|| "扫描脚本没有返回数据".to_string())?;
+    // ConvertTo-Json 在只有一项时会输出对象而不是数组，这里统一成数组再解析
+    let text = line.trim();
+    let items: Vec<LocalApp> = if text.starts_with('[') {
+        serde_json::from_str(text).map_err(|e| format!("解析扫描结果失败: {e}"))?
+    } else {
+        vec![serde_json::from_str(text).map_err(|e| format!("解析扫描结果失败: {e}"))?]
+    };
+    log_line(&app, "scan-local", &format!("本机软件 {} 个", items.len()));
+    Ok(items)
+}
+
+/// 清理某个软件的安装残留（注册表 Uninstall 条目 + 确认无主程序的空目录）
+async fn purge_stale_entries(
+    app: &AppHandle,
+    name: &str,
+    dry_run: bool,
+) -> Result<PurgeResult, String> {
+    let out = run_ps1(
+        app,
+        "purge_stale.ps1",
+        PURGE_STALE_PS1,
+        &[
+            ("TOOLARK_NAME", name.to_string()),
+            ("TOOLARK_DRYRUN", if dry_run { "1" } else { "0" }.to_string()),
+        ],
+    )
+    .await?;
+    let line = out
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        .ok_or_else(|| "清理脚本没有返回数据".to_string())?;
+    let r: PurgeResult =
+        serde_json::from_str(line.trim()).map_err(|e| format!("解析清理结果失败: {e}"))?;
+    log_line(
+        app,
+        "purge",
+        &format!(
+            "{name}: dry_run={dry_run} removed={} dirs={} errors={}",
+            r.removed,
+            r.dirs.len(),
+            r.errors.join("|")
+        ),
+    );
+    Ok(r)
+}
+
+/// 清理安装残留（前端显式调用，用于「打开失败 → 一键清理」）
+#[tauri::command]
+async fn purge_stale(app: AppHandle, name: String) -> Result<String, String> {
+    if name.trim().is_empty() || name.len() > 200 {
+        return Err("无效的软件名".into());
+    }
+    let r = purge_stale_entries(&app, &name, false).await?;
+    if r.removed == 0 {
+        return Err(format!(
+            "没找到 {name} 的残留注册表条目{}",
+            if r.errors.is_empty() {
+                String::new()
+            } else {
+                format!("（{}）", r.errors.join("；"))
+            }
+        ));
+    }
+    Ok(format!(
+        "已清理 {} 条残留记录{}{}",
+        r.removed,
+        if r.dirs.is_empty() {
+            String::new()
+        } else {
+            format!("、{} 个空目录", r.dirs.len())
+        },
+        if r.errors.is_empty() {
+            String::new()
+        } else {
+            format!("；{} 项未能处理", r.errors.len())
+        }
+    ))
+}
 
 #[tauri::command]
 fn cancel_install(app: AppHandle, tool_id: String) -> Result<String, String> {
@@ -931,6 +1067,58 @@ async fn uninstall_tool(
             "uninstall",
             &format!("失败 {name}: {}", log.chars().take(500).collect::<String>()),
         );
+
+        // winget 卸载失败最常见的原因是安装器本身已丢失（0x800401f5 Application not found），
+        // 此时 winget 仍认为包装着，但注册表里的卸载器指向一个不存在的文件。
+        // 这种情况下自动降级为「清理注册表残留」，否则用户永远卸不掉这个幽灵条目。
+        let looks_stale = log.contains("0x800401f5")
+            || log.contains("Application not found")
+            || log.contains("应用程序未找到")
+            || log.contains("0x80070002");
+        if looks_stale {
+            match purge_stale_entries(&app, &name, false).await {
+                Ok(p) if p.removed > 0 => {
+                    let mut ids = read_records(&app);
+                    ids.retain(|x| x != &tool_id);
+                    let _ = write_records(&app, &ids);
+                    log_line(
+                        &app,
+                        "uninstall",
+                        &format!("{name} 卸载器丢失，已清理 {} 条残留注册表项", p.removed),
+                    );
+                    return Ok(format!(
+                        "{} 的卸载程序已丢失，已改为清理安装残留：移除 {} 条注册表记录{}",
+                        name,
+                        p.removed,
+                        if p.dirs.is_empty() {
+                            String::new()
+                        } else {
+                            format!("、{} 个空目录", p.dirs.len())
+                        }
+                    ));
+                }
+                Ok(p) => {
+                    return Err(format!(
+                        "卸载 {} 失败：安装器已丢失，但自动清理没找到可移除的注册表条目（{}）。可在「设置 → 诊断」导出日志后手动清理。",
+                        name,
+                        if p.errors.is_empty() {
+                            "无匹配项".to_string()
+                        } else {
+                            p.errors.join("；")
+                        }
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "卸载 {} 失败：安装器已丢失，自动清理残留也出错（{}）。原始错误：{}",
+                        name,
+                        e,
+                        summarize(log.as_bytes(), b"")
+                    ));
+                }
+            }
+        }
+
         return Err(format!(
             "卸载 {} 失败: {}",
             name,
@@ -1118,6 +1306,10 @@ pub struct OpenResult {
     ok: bool,
     message: String,
     exe: Option<String>,
+    /// 安装残留（注册表有条目但程序文件已不在）：界面应引导清理而不是只报错
+    stale: bool,
+    /// 残留清理可用的软件名（就是传给清理脚本的名字）
+    stale_name: Option<String>,
 }
 
 /// 打开已安装的应用
@@ -1128,19 +1320,51 @@ async fn open_tool(
     _tool_id: Option<String>,
 ) -> Result<OpenResult, String> {
     let Some(target) = lookup_app(&app, &name).await else {
+        // 连注册表条目都没命中：既可能是便携版，也可能是彻底没装
         return Ok(OpenResult {
             ok: false,
-            message: format!("未能定位 {name} 的启动程序，可能安装到了非标准位置"),
+            message: format!(
+                "没能找到 {name} 的安装记录。它可能已被卸载、或是免安装的绿色版——可以在「已安装」里移除这条记录，或重新安装一次。"
+            ),
             exe: None,
+            stale: true,
+            stale_name: Some(name),
         });
     };
+
     let Some(exe) = target.exe.clone() else {
+        // 注册表有条目但没有可执行文件：这是 ARP 残留
+        let loc = target.install_location.clone().unwrap_or_default();
+        let detail = if loc.is_empty() {
+            "注册表里还留着它的卸载条目，但程序文件已经不在了。".to_string()
+        } else {
+            format!("注册表指向 {loc}，但那里的程序文件已经不在了。")
+        };
+        log_line(&app, "open", &format!("残留 {name}: {detail}"));
         return Ok(OpenResult {
             ok: false,
-            message: "未找到可执行文件".into(),
+            message: format!("{detail}这是安装残留，可以一键清理掉。"),
             exe: None,
+            stale: true,
+            stale_name: Some(name),
         });
     };
+
+    // 缓存可能指向已删除的文件（用户在资源管理器里手动删过目录）
+    if !Path::new(&exe).exists() {
+        log_line(&app, "open", &format!("残留 {name}: 缓存路径已失效 {exe}"));
+        let mut cache = read_app_cache(&app);
+        cache.remove(&name);
+        let _ = write_app_cache(&app, &cache);
+        return Ok(OpenResult {
+            ok: false,
+            message: format!("{name} 的程序文件 {exe} 已不存在，已清除失效的路径缓存。可以在「已安装」里清理这条残留记录。"),
+            exe: None,
+            stale: true,
+            stale_name: Some(name),
+        });
+    }
+
     let mut cmd = std::process::Command::new(&exe);
     if let Some(dir) = &target.workdir {
         if Path::new(dir).exists() {
@@ -1159,12 +1383,16 @@ async fn open_tool(
                 ok: true,
                 message: format!("已启动 {name}"),
                 exe: Some(exe),
+                stale: false,
+                stale_name: None,
             })
         }
         Err(e) => Ok(OpenResult {
             ok: false,
-            message: format!("启动失败: {e}"),
+            message: format!("启动 {name} 失败：{e}（文件在 {exe}）"),
             exe: Some(exe),
+            stale: false,
+            stale_name: None,
         }),
     }
 }
@@ -1789,7 +2017,9 @@ pub fn run() {
             upgrade_tool,
             check_winget,
             read_logs,
-            export_diagnostics
+            export_diagnostics,
+            scan_local_apps,
+            purge_stale
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

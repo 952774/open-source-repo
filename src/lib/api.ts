@@ -94,7 +94,8 @@ export async function cancelInstall(toolId: string): Promise<CommandResult> {
   }
 }
 
-/** 打开系统目录选择器（仅桌面版；浏览器返回 null） */export async function pickInstallDirectory(): Promise<string | null> {
+/** 打开系统目录选择器（仅桌面版；浏览器返回 null） */
+export async function pickInstallDirectory(): Promise<string | null> {
   if (!isTauri()) return null;
   try {
     const { open } = await import('@tauri-apps/plugin-dialog');
@@ -233,6 +234,10 @@ export interface OpenResult {
   ok: boolean;
   message: string;
   exe: string | null;
+  /** 安装残留（注册表有条目但程序文件已不在），界面应引导一键清理 */
+  stale?: boolean;
+  /** 清理残留时传给 purge_stale 的软件名 */
+  staleName?: string | null;
 }
 
 export interface AppTarget {
@@ -253,6 +258,46 @@ export async function openTool(name: string, toolId?: string): Promise<OpenResul
     return await invoke<OpenResult>('open_tool', { name, toolId: toolId ?? null });
   } catch (err) {
     return { ok: false, message: String(err), exe: null };
+  }
+}
+
+/* ---------- 本机软件扫描 / 残留清理 ---------- */
+
+/** 注册表里扫描到的一条本机软件 */
+export interface LocalApp {
+  name: string;
+  version: string;
+  publisher: string;
+  installLocation: string | null;
+  exe: string | null;
+  homepage: string;
+  uninstallString: string;
+  scope: string;
+  /** 注册表有条目但程序文件已不在 = 安装残留 */
+  stale: boolean;
+}
+
+/**
+ * 扫描本机注册表里的全部软件（不限于 ToolArk 收录的清单）。
+ * 用于「本机软件」视图：用户已经装过的东西不该再显示成"未安装"。
+ */
+export async function scanLocalApps(): Promise<LocalApp[]> {
+  if (!isTauri()) return [];
+  try {
+    return await invoke<LocalApp[]>('scan_local_apps');
+  } catch {
+    return [];
+  }
+}
+
+/** 清理某个软件的安装残留（注册表条目 + 确认无主程序的空目录） */
+export async function purgeStale(name: string): Promise<CommandResult> {
+  if (!isTauri()) return { ok: false, message: '仅桌面版可用' };
+  try {
+    const message = await invoke<string>('purge_stale', { name });
+    return { ok: true, message };
+  } catch (err) {
+    return { ok: false, message: String(err) };
   }
 }
 

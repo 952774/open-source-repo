@@ -166,11 +166,24 @@ foreach ($e in $hits) {
 }
 if (-not $loc -and $found) { $loc = $workdir }
 
+# 残留判定：注册表里有这个软件的条目，但主程序文件已经不在了。
+# 典型成因是安装器崩溃、用户手动删目录、或卸载程序自身丢失（0x800401f5），
+# 此时 winget list 仍会把它列为"已安装"，点打开必然失败——必须给出可操作的处置。
+$stale = ($hits.Count -gt 0 -and -not $found)
+
+$uninst = $null
+foreach ($e in $hits) {
+  if ($e.UninstallString) { $uninst = ([string]$e.UninstallString).Trim(); break }
+}
+
 $obj = [ordered]@{
   exe             = $found
   workdir         = $workdir
   displayName     = $dn
   installLocation = $loc
+  uninstallString = $uninst
+  stale           = $stale
+  matches         = $hits.Count
   source          = $src
 }
 Write-Output ($obj | ConvertTo-Json -Compress)
