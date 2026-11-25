@@ -200,7 +200,6 @@ function ToolCard({
           <span className="tag verified">✓ {zh ? '开源' : 'OSS'}</span>
           <span className="tag gray">{tool.license}</span>
           {hasUpdate && <span className="tag update">⬆ {zh ? '有新版' : 'Update'}</span>}
-          {isInstalled && !hasUpdate && <span className="tag green">{zh ? '已安装' : 'Installed'}</span>}
         </div>
         <div className="card-actions">
           {isInstalled && (

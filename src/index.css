@@ -374,11 +374,16 @@ a { color: var(--brand); text-decoration: none; }
   scroll-behavior: smooth;
 }
 
-.section-head { display: flex; align-items: baseline; gap: 10px; margin: 8px 0 14px; }
+/* v1.2.0：标题行允许折行，操作按钮靠右；窄窗口下按钮不会被挤出容器 */
+.section-head {
+  display: flex; align-items: center; gap: 10px; margin: 8px 0 14px;
+  flex-wrap: wrap; row-gap: 8px;
+}
 .section-head h2 {
   font-size: 20px; font-weight: 650; letter-spacing: -0.015em;
 }
 .section-head span { font-size: 12.5px; color: var(--ink-3); font-weight: 400; }
+.section-head > button:first-of-type { margin-left: auto; }
 
 /* ============================================================ Bundles */
 /* v1.2.0：快捷套装改成 App Store「精选合集」那种安静瓷砖——

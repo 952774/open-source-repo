@@ -1,7 +1,7 @@
 {
   "name": "toolark",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.2.1",
   "type": "module",
   "description": "ToolArk 工具方舟 —— GitHub 优质工具聚合桌面应用",
   "scripts": {
